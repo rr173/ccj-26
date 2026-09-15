@@ -1,0 +1,58 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: policy
+      POSTGRES_PASSWORD: policy
+      POSTGRES_DB: policy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U policy -d policy"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  compiler:
+    build: .
+    command: ["uvicorn", "app.compiler.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://policy:policy@db:5432/policy
+      SERVICE_NAME: compiler
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8002:8002"
+
+  editor:
+    build: .
+    command: ["uvicorn", "app.editor.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://policy:policy@db:5432/policy
+      SERVICE_NAME: editor
+      COMPILER_URL: http://compiler:8002
+    depends_on:
+      db:
+        condition: service_healthy
+      compiler:
+        condition: service_started
+    ports:
+      - "8001:8001"
+
+  runtime:
+    build: .
+    command: ["uvicorn", "app.runtime.main:app", "--host", "0.0.0.0", "--port", "8003"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://policy:policy@db:5432/policy
+      SERVICE_NAME: runtime
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8003:8003"
+
+volumes:
+  pgdata:
