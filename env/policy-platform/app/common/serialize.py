@@ -1,6 +1,16 @@
 """序列化辅助：ORM -> API 字典，以及查询输入摘要。"""
 import hashlib
 import json
+from datetime import timezone
+
+
+def _iso(dt):
+    """统一输出带时区的 ISO8601（SQLite 取回的 naive datetime 按 UTC 处理）。"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
 
 
 def summarize_inputs(inputs: dict) -> dict:
@@ -22,7 +32,7 @@ def frag_dict(f) -> dict:
         "content_hash": f.content_hash,
         "body": f.body,
         "updated_by": f.updated_by,
-        "updated_at": f.updated_at,
+        "updated_at": _iso(f.updated_at),
     }
 
 
@@ -32,7 +42,7 @@ def policy_dict(p) -> dict:
         "entry_fragment": p.entry_fragment,
         "description": p.description,
         "latest_version": p.latest_version,
-        "created_at": p.created_at,
+        "created_at": _iso(p.created_at),
     }
 
 
@@ -46,14 +56,14 @@ def artifact_dict(a) -> dict:
         "revoked": a.revoked,
         "revoke_reason": a.revoke_reason,
         "revoked_by": a.revoked_by,
-        "created_at": a.created_at,
+        "created_at": _iso(a.created_at),
     }
 
 
 def decision_dict(d) -> dict:
     return {
         "id": d.id,
-        "ts": d.ts,
+        "ts": _iso(d.ts),
         "request_id": d.request_id,
         "policy": d.policy,
         "requested_min_version": d.requested_min_version,
@@ -72,8 +82,59 @@ def decision_dict(d) -> dict:
 def audit_dict(e) -> dict:
     return {
         "id": e.id,
-        "ts": e.ts,
+        "ts": _iso(e.ts),
         "service": e.service,
+        "event_type": e.event_type,
+        "actor": e.actor,
+        "payload": e.payload,
+    }
+
+
+def proposal_dict(p, *, include_changes=False) -> dict:
+    out = {
+        "id": p.id,
+        "title": p.title,
+        "status": p.status,
+        "proposer": p.proposer,
+        "scheduled_at": _iso(p.scheduled_at),
+        "expires_at": _iso(p.expires_at),
+        "created_at": _iso(p.created_at),
+        "decided_at": _iso(p.decided_at),
+        "effective_at": _iso(p.effective_at),
+        "impacted_policies": p.baseline.get("policies"),
+        "approval_rules": p.baseline.get("approval_rules"),
+        "changes": [
+            {"fragment": c["fragment"], "action": c["action"],
+             "base_version": c["base_version"], "base_hash": c["base_hash"],
+             "new_hash": c["new_hash"],
+             "change_count": c["diff"]["change_count"]}
+            for c in p.changes
+        ],
+        "applied": p.applied,
+        "conflict_reason": p.conflict_reason,
+    }
+    if include_changes:
+        out["baseline"] = p.baseline
+        out["changes"] = p.changes  # 含 base_body/new_body/逐项 diff
+    return out
+
+
+def review_dict(r) -> dict:
+    return {
+        "id": r.id,
+        "proposal_id": r.proposal_id,
+        "reviewer": r.reviewer,
+        "role": r.role,
+        "decision": r.decision,
+        "comment": r.comment,
+        "ts": _iso(r.created_at),
+    }
+
+
+def proposal_event_dict(e) -> dict:
+    return {
+        "id": e.id,
+        "ts": _iso(e.ts),
         "event_type": e.event_type,
         "actor": e.actor,
         "payload": e.payload,

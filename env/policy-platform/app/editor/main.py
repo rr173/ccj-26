@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
-from ..common import compiler_client, events
+from ..common import compiler_client, events, proposal_service, scheduler
 from ..common.compiler_core import CycleError, MissingRefError, resolve_order
 from ..common.config import SERVICE_NAME
 from ..common.db import SessionLocal, init_db
@@ -21,6 +21,7 @@ from ..common.routers import audit_router
 from ..common.schemas import (FragmentCreate, FragmentUpdate, PolicyCreate,
                               PublishRequest)
 from ..common.serialize import artifact_dict, frag_dict, policy_dict
+from .proposals import router as proposals_router
 
 
 @asynccontextmanager
@@ -30,11 +31,15 @@ async def lifespan(app):
         events.audit(s, SERVICE_NAME, "SERVICE_STARTED", None,
                      hostname=socket.gethostname(), pid=os.getpid())
         s.commit()
+    # 提案调度器：恢复未到点预约/崩溃残留，重启后继续处理（评审状态在库里不受影响）
+    scheduler.start(SERVICE_NAME)
     yield
+    scheduler.stop()
 
 
 app = FastAPI(title="policy-editor", lifespan=lifespan)
 app.include_router(audit_router)
+app.include_router(proposals_router)
 
 
 @app.get("/health")
@@ -112,6 +117,12 @@ def update_fragment(name: str, req: FragmentUpdate):
             "error": resp.text, "status_code": resp.status_code}
     except compiler_client.CompilerUnavailable as e:
         out["recompile"] = {"error": f"compiler unavailable: {e}"}
+
+    # 片段在提案流程之外再次变化：固定了该片段基线的等待中提案立即标冲突（评审意见保留）
+    with SessionLocal() as s:
+        out["conflicted_proposals"] = proposal_service.mark_drifted(
+            s, trigger={"type": "fragment_updated_out_of_band", "by": req.actor,
+                        "fragment": name})
     return out
 
 
@@ -222,4 +233,10 @@ def publish(name: str, req: PublishRequest):
     payload = resp.json()
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, payload)
+    # 直接发布移动了策略基线：等待中且固定旧基线的提案随之冲突（意见保留）
+    if payload.get("status") == "published":
+        with SessionLocal() as s:
+            payload["conflicted_proposals"] = proposal_service.mark_drifted(
+                s, trigger={"type": "direct_publish", "by": req.actor,
+                            "policies": [name]})
     return payload

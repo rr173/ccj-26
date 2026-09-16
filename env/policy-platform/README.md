@@ -23,7 +23,7 @@
             └──────────────────────┘
 ```
 
-- **editor**：片段/策略 CRUD、发布入口、依赖链查询。片段更新后调用 compiler 做**增量重编译**。
+- **editor**：片段/策略 CRUD、发布入口、依赖链查询、**变更提案与评审工作流**。片段更新后调用 compiler 做**增量重编译**。
 - **compiler**：依赖图解析、循环检测、拓扑排序、生成不可变版本产物；撤销版本。
 - **runtime**：按 `min_version` 选版执行；节点未加载/超时按回退规则降级；记录决策日志。
 - 三个服务无共享内存状态，各自独立扩缩容；共享存储只有数据库。
@@ -39,7 +39,7 @@ docker compose up --build        # db + compiler + editor + runtime
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/                       # 28 个测试
+python -m pytest tests/                       # 60 个测试
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.compiler.main:app --port 8002 &
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.editor.main:app --port 8001 &
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.runtime.main:app --port 8003 &
@@ -93,6 +93,48 @@ DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.runtime.main:app --port 80
 - **依赖链**（`GET /policies/{name}/chain`）：实时片段图（节点/边/环/缺失引用/求值顺序）
   + 最新产物固化的依赖链。
 
+### 变更管控：提案 → 评审 →（立即/预约）生效
+
+策略变更不再直接进入运行环境，必须走提案。核心在 `proposal_service.py` + `semdiff.py`。
+
+**提交即固化（`POST /proposals`）**
+- 每个变更项（片段名 + 新正文）在提交时固定：基线版本/哈希/正文、新正文哈希、**逐项语义差异**；
+- 固定**影响范围**：受影响策略、整个依赖闭包内片段的版本/哈希、各策略当前产物版本、
+  本次生效所需的审批角色规则（全局默认 ∪ 策略专属，同角色取最大人数）；
+- 提交时用"叠加后的内存片段视图"**预演编译**：环/缺失引用/DSL 错误、无实质变化、
+  变更不触达任何策略都会在提交阶段拒绝（不会等到生效才失败）。
+- `GET /proposals/{id}/diff` 查看逐项差异：按 JSON 路径（`$.args[1][2]`）给出
+  added/removed/literal_changed/operator_changed/variable_changed/reference_changed/
+  structure_changed，并汇总引用片段、输入变量、算子集合的增减。
+
+**评审规则**
+- **发起人不能审批自己的提案**（403 `self_approval_forbidden`）；
+- 必须满足提案固定的"角色 × 不同人数"（`PUT /proposals/approval-config-default`
+  或 `/approval-config/{policy}`），同一人多角色/重复同意只算一票；
+- **重复评审幂等**：同一评审人再次提交返回 `already_reviewed`，不产生第二条意见、事件、审计；
+- 任一评审人拒绝 → `REJECTED`（终态）；发起人可 `withdraw`；
+- 超过 `expires_at` 仍未满足人数 → 调度周期或再次评审时标记 `EXPIRED`。
+
+**生效与冲突**
+- 满足人数时：无预约（或预约已到点）→ 同事务内立即 `EFFECTIVE`；
+  预约时间未到 → `SCHEDULED`，由 editor 后台调度器到点生效；
+- 同策略多个提案按 **`(scheduled_at, id)` 确定顺序**生效；排在前面的先生成新产物、
+  移动基线，**较晚提案执行前逐项核对固定基线，发现片段/产物版本已变即停止**，
+  标记 `CONFLICT` 并在 `conflict_reason` 给出漂移项（片段/策略、固定版本 vs 当前版本）；
+- 评审期间依赖片段在提案之外再次变化（直接 `PUT /fragments`、直接 publish）同样立即标冲突；
+  **冲突只改提案状态与时间线，已给出的评审意见原样保留**；
+- 拒绝/撤回/过期/冲突的提案都不会生效；
+- **重复执行幂等**：调度器用 `SCHEDULED→APPLYING` 原子认领 + 状态守卫，重复触发对已生效提案
+  返回 `already_effective`，不产生新版本/新事件/新审计。
+
+**时间线查询（`GET /proposals/{id}/timeline`）**：提交、每位评审人的决定（`/reviews`）、
+当时固定的逐项差异、拒绝/撤回/过期/冲突、以及最终进入运行环境的产物
+（`runtime_artifacts: [{policy, version, hash}]`）。
+
+**重启续处理**：评审意见、预约时间、提案状态全部在数据库；调度器只是"到点触发"。
+editor 重启后：复位崩溃残留的 `APPLYING`，立即跑一个周期（宕机期间到点的立即生效），
+未到点的预约继续等到点，等待中的评审继续可处理。调度周期由 `SCHEDULER_INTERVAL_MS` 控制。
+
 ## DSL 参考
 
 ```jsonc
@@ -110,9 +152,15 @@ endswith lower upper concat len abs min max round coalesce if`，以及测试辅
 ## API 一览
 
 **editor :8001**
-`POST/GET /fragments`、`GET/PUT /fragments/{name}`（更新触发增量重编译）、
+`POST/GET /fragments`、`GET/PUT /fragments/{name}`（更新触发增量重编译，并把固定了旧基线的等待中提案标冲突）、
 `POST/GET /policies`、`GET /policies/{name}`、`GET /policies/{name}/versions`、
-`GET /policies/{name}/chain`、`POST /policies/{name}/publish`、`GET /audit`
+`GET /policies/{name}/chain`、`POST /policies/{name}/publish`、
+提案：`POST/GET /proposals`、`GET /proposals/{id}`、`GET /proposals/{id}/diff`、
+`POST /proposals/{id}/reviews`、`GET /proposals/{id}/reviews`、
+`POST /proposals/{id}/withdraw`、`POST /proposals/{id}/apply`、
+`GET /proposals/{id}/timeline`、
+`GET /proposals/approval-config`、`PUT /proposals/approval-config-default`、
+`PUT /proposals/approval-config/{policy}`、`GET /audit`
 
 **compiler :8002**
 `POST /compile`、`POST /compile/affected`、`POST /compile/batch`、
