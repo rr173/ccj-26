@@ -218,8 +218,8 @@ service_restart）/ 接管（lease_taken_over）/ 续租 / 分叉（forked，含
 ## 资源消耗台账与周期限额（quota :8005）
 
 为每次规则判定建立资源消耗台账与周期限额。判定生命周期（同一业务流水 `serial`
-贯穿）：**占用（判定开始，预估量先占余额）→ 凭证（判定结束真实消耗）→
-销账（差额自动补退）**；异常退出或超时则**归还占用**。
+贯穿）：**占用（判定开始，前置门禁同步给出通行令/驳回，预估量先占余额）→
+凭证（判定结束真实消耗）→ 销账（差额自动补退）**；异常退出或超时则**归还占用**。
 
 ```
 业务端                collector 采集            gate 前置门禁            accountant 核算
@@ -231,6 +231,24 @@ POST /quota/aborts ──▶                      ──▶ 归还 / 超时回�
 **作用域（共用/分别设限）**：规则注册为 `mode=shared` 时并入账户共享池
 （`scope_rule=""`，多条规则共用一份限额）；`mode=dedicated` 时按规则名独立设限。
 
+- **先裁决、后计算（同步通行令/驳回）**：`POST /quota/holds` 在 gate 所在进程
+  （默认 `QUOTA_ROLE=all`）于**同一个写事务**内完成「采集去重 → 锁限额行 →
+  判余额 → 占用/拒签落终态」，直接返回 200 终态裁决：通过为
+  `verdict=GRANTED` 并带 HMAC-SHA256 **通行令** `verdict.token`，
+  拒绝为 `verdict=REJECTED` + `reject_reason`（如 `quota_exceeded`）。
+  客户端拿到终态裁决前不得启动后续计算。通行令只对裁决一刻即固定的字段签名
+  （不含后续生命周期状态），同一 `serial` 无论何时、经哪个组件、在销账/归还
+  之后重取，签文完全一致；多实例共用 `QUOTA_VERDICT_SECRET` 时跨进程一致，
+  不配置则按库自动生成持久化密钥（同库任意组件一致）。
+- **裁决可重复获取**：`GET /quota/holds/{serial}/verdict` 按流水号取回裁决；
+  网络抖动、断线重连、请求重发拿到的都是同一份答复（重发相同 `POST` 返回
+  `duplicate:true` 与同一裁决）。
+- **组件分离运转**：`QUOTA_ROLE` 不含 gate 时，`POST /quota/holds` 仅入采集箱
+  （202 `NEW`），轮询裁决端点在 gate 裁决前得到 202 `PENDING`、裁决后得到
+  同一份终态。inline 受理与独立 gate 工作器以「事件 NEW→PROCESSING 原子认领 +
+  限额行锁 + 占用 serial 唯一」三重互斥，绝不产生两个裁决或两次占用。
+- **断线不留死冻结**：裁决/通行令在客户端断线时已落库；通过的占用受 TTL 约束，
+  业务侧 `abort` 或 gate `reap_expired` 都能归还到产生周期；拒签不占任何余额。
 - **重投消除**：采集箱 `(serial, event_type)` 唯一，重投返回 `duplicate:true`，
   绝不重复入账；同流水同类型但内容不一致报 `serial_conflict`。
 - **乱序接纳**：凭证先于占用到达时凭证置 `PENDING`，后续核算周期自动配对；
@@ -313,7 +331,10 @@ endswith lower upper concat len abs min max round coalesce if`，以及测试辅
 **quota :8005**（`QUOTA_ROLE=collector,gate,accountant` 可分开启动）
 管理：`POST /quota/accounts`、`POST /quota/rules`（mode=shared/dedicated）、
 `POST /quota/limits`（`{scope_rule?, amount, effective_from?}`）
-采集：`POST /quota/holds`、`POST /quota/vouchers`、`POST /quota/aborts`、
+采集：`POST /quota/holds`（gate 在本进程时同步返回 200 终态裁决/通行令；
+gate 分离时 202 入箱）、`GET /quota/holds/{serial}/verdict`
+（终态=200；未裁决=202 PENDING）、
+`POST /quota/vouchers`、`POST /quota/aborts`、
 `GET /quota/events`、`POST /quota/events/{id}/requeue`
 门禁/凭证查询：`GET /quota/holds`、`GET /quota/vouchers`
 核算：`POST /quota/batches/seal`、`POST /quota/batches/auto-seal`、

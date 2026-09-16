@@ -176,14 +176,18 @@ curl -s -X POST "$QUOTA/quota/accounts" -H 'content-type: application/json' \
 curl -s -X POST "$QUOTA/quota/rules" -H 'content-type: application/json' \
   -d '{"account":"demo","rule_name":"fraud","mode":"dedicated","initial_limit":100}' | jq -c '{rule: .rule_name, scope}'
 
-step "17. 判定开始先占用：60 通过、再来 50 被门禁拒绝（总量不破 100），重投返回 duplicate"
+step "17. 判定开始先占用：60 通过并签发通行令、再来 50 当场驳回（总量不破 100），重投回放同一裁决"
 curl -s -X POST "$QUOTA/quota/holds" -H 'content-type: application/json' \
-  -d '{"serial":"d1","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:00:00+08:00","amount":60}' | jq -c .
+  -d '{"serial":"d1","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:00:00+08:00","amount":60}' \
+  | jq -c '{duplicate, verdict: .verdict.verdict, status: .verdict.status, token: .verdict.token}'
 curl -s -X POST "$QUOTA/quota/holds" -H 'content-type: application/json' \
-  -d '{"serial":"d1","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:00:00+08:00","amount":60}' | jq -c .
+  -d '{"serial":"d1","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:00:00+08:00","amount":60}' \
+  | jq -c '{duplicate, verdict: .verdict.verdict, token: .verdict.token}'
+echo "-- 网络抖动后再次询问，拿到同一份裁决："
+curl -s "$QUOTA/quota/holds/d1/verdict" | jq -c '{verdict, status, token}'
 curl -s -X POST "$QUOTA/quota/holds" -H 'content-type: application/json' \
-  -d '{"serial":"d2","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:00:00+08:00","amount":50}' | jq -c .
-curl -s -X POST "$QUOTA/tick/gate" >/dev/null
+  -d '{"serial":"d2","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:00:00+08:00","amount":50}' \
+  | jq -c '{verdict: .verdict.verdict, reject_reason: .verdict.reject_reason}'
 curl -s "$QUOTA/quota/holds?account=demo" | jq -c '[.[] | {serial, status, reject_reason}]'
 
 step "18. 真实消耗 40 销账（预估 60，差额 20 自动退回），可花余额回到 60"

@@ -717,32 +717,364 @@ def test_trace_serial_full_chain(svc):
         assert settle["cross_period"] is True
 
 
+def test_inline_does_not_double_adjudicate_when_gate_claimed(svc):
+    """inline 受理与独立 gate 争抢同一 NEW 事件：事件先被 gate 认领（PROCESSING）
+    时，inline 路径不得自行下判，只报 PENDING；gate 完成后仍是唯一裁决。"""
+    with SessionLocal() as s:
+        submit(s, "race1", "hold", "r1", at(2026, 9, 16, 4), {"amount": 10})
+        s.commit()
+        ev = s.query(QuotaInboxEvent).filter_by(serial="race1").one()
+        ev.status, ev.claimed_by = "PROCESSING", "gate-other"
+        s.commit()
+
+    with SessionLocal() as s:
+        r = qs.submit_and_adjudicate_hold(
+            s, serial="race1", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4), amount=10)
+        s.commit()
+        assert r["duplicate"] is True
+        assert (r["verdict"]["verdict"],
+                r["verdict"]["event_status"]) == ("PENDING", "PROCESSING")
+        # 没有产生占用行（inline 没有抢判）
+        assert s.query(QuotaHold).filter_by(serial="race1").count() == 0
+
+    # gate 周期完成裁决（认领恢复 + 处理）
+    qs.recover_processing(SessionLocal(), "gate-restart")
+    worker.gate_tick("gate-restart")
+    with SessionLocal() as s:
+        v = qs.get_hold_verdict(s, "race1")
+        assert v["verdict"] == "GRANTED"
+        assert s.query(QuotaHold).filter_by(serial="race1").count() == 1
+
+
+def test_mixed_inline_and_worker_contention_never_oversells(svc):
+    """40 客户端争 100 额度（每笔 10）：一半走 inline 同步受理，一半走采集箱
+    + gate 工作器认领。任何交错下：恰好 10 笔占用，每个 serial 至多一行
+    占用（不重复裁决），拒绝均为 quota_exceeded。"""
+    errors: list[Exception] = []
+
+    def inline_client(i):
+        try:
+            with SessionLocal() as s:
+                qs.submit_and_adjudicate_hold(
+                    s, serial=f"mix{i:02d}", account="acct", rule_name="r1",
+                    occurred_at=at(2026, 9, 16, 4), amount=10)
+                s.commit()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    def worker_client(i):
+        try:
+            with SessionLocal() as s:
+                submit(s, f"mix{i:02d}", "hold", "r1", at(2026, 9, 16, 4),
+                       {"amount": 10})
+                s.commit()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+            return
+        # 不等批次：像积极的 gate 一样立即尝试认领处理
+        try:
+            with SessionLocal() as s:
+                ev = qs.claim_next_event(s, ("hold",), f"gw{i}")
+                if ev is not None:
+                    qs.process_hold_event(s, ev, at(2026, 9, 16, 4))
+                    s.commit()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = []
+    for i in range(40):
+        target = inline_client if i % 2 == 0 else worker_client
+        threads.append(threading.Thread(target=target, args=(i,)))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    # 再把剩余事件驱动到终态（gate_tick 内的 reap 用墙钟，会回收固定 2026
+    # 日期的未结占用；此处直接循环认领处理，不跑超时回收）：
+    while True:
+        with SessionLocal() as s:
+            ev = qs.claim_next_event(s, ("hold",), "gw-final")
+            if ev is None:
+                break
+            qs.process_hold_event(s, ev, at(2026, 9, 16, 4))
+            s.commit()
+    with SessionLocal() as s:
+        holds = s.query(QuotaHold).all()
+        assert len(holds) == 40                       # 每流水恰好一行裁决
+        held = [h for h in holds if h.status == "HELD"]
+        rejected = [h for h in holds if h.status == "REJECTED"]
+        assert sum(h.amount for h in held) == 100     # 总量不破阈值
+        assert len(held) == 10 and len(rejected) == 30
+        assert {h.reject_reason for h in rejected} == {"quota_exceeded"}
+        assert len({h.serial for h in holds}) == 40
+
+
+# ---------------------------------------------------------------------------
+# 同步受理：先拿到唯一确定的通行令/驳回，才能开始后续计算
+# ---------------------------------------------------------------------------
+
+def test_over_limit_rejected_immediately_without_gate_cycle(svc):
+    """阈值 100、申请 150：不必推进任何 gate 周期，立即拿到确定性驳回，
+    且立刻读取就能读到裁决（修复前是 202/NEW + 读不到 + 等手推周期）。"""
+    with SessionLocal() as s:
+        r = qs.submit_and_adjudicate_hold(
+            s, serial="big", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4), amount=150)
+        s.commit()
+    assert r["duplicate"] is False
+    assert (r["verdict"]["verdict"], r["verdict"]["decided"],
+            r["verdict"]["reject_reason"]) == ("REJECTED", True, "quota_exceeded")
+
+    # 立刻读（另一个连接/网络抖动后的再次询问）：同一份裁决
+    with SessionLocal() as s:
+        again = qs.get_hold_verdict(s, "big")
+        assert (again["verdict"], again["reject_reason"]) == \
+            ("REJECTED", "quota_exceeded")
+        h = s.query(QuotaHold).filter_by(serial="big").one()
+        assert h.status == "REJECTED"
+        # 驳回不占余额：小申请仍可通过
+        ok = qs.submit_and_adjudicate_hold(
+            s, serial="small", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4, 0, 1), amount=100)
+        s.commit()
+        assert ok["verdict"]["verdict"] == "GRANTED"
+
+
+def test_pass_token_is_unique_and_repeatable(svc):
+    with SessionLocal() as s:
+        a = qs.submit_and_adjudicate_hold(
+            s, serial="t1", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4), amount=10)
+        b = qs.submit_and_adjudicate_hold(
+            s, serial="t2", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4), amount=20)
+        # 重投（相同内容）：duplicate 且回放同一通行令
+        a2 = qs.submit_and_adjudicate_hold(
+            s, serial="t1", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4), amount=10)
+        s.commit()
+        tok = a["verdict"]["token"]
+        assert isinstance(tok, str) and len(tok) == 64
+        assert a2["duplicate"] is True and a2["verdict"]["token"] == tok
+        # 不同流水的通行令不同
+        assert b["verdict"]["token"] != tok
+        # 任何时刻重新查询，签文完全一致（网络抖动后也拿到同一份）
+        assert qs.get_hold_verdict(s, "t1")["token"] == tok
+
+    # 同 serial 重投但内容不一致 -> 冲突（不能让第二次申请篡改裁决）
+    with SessionLocal() as s:
+        with pytest.raises(qs.QuotaError) as e:
+            qs.submit_and_adjudicate_hold(
+                s, serial="t1", account="acct", rule_name="r1",
+                occurred_at=at(2026, 9, 16, 4), amount=11)
+        assert e.value.code == "serial_conflict"
+
+
+def test_inline_admitted_events_are_not_reprocessed_by_gate(svc):
+    with SessionLocal() as s:
+        qs.submit_and_adjudicate_hold(
+            s, serial="g1", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4), amount=10)
+        s.commit()
+    # gate 工作器周期扫描时事件已是 DONE：不会二次裁决、不会重复占用
+    assert worker.gate_tick("gate-inline")["admitted"] == 0
+    with SessionLocal() as s:
+        assert s.query(QuotaHold).filter_by(serial="g1").count() == 1
+
+
+def test_split_roles_pending_poll_then_single_answer(svc, monkeypatch):
+    """gate 组件分离运转：collector 只给 202；裁决未出前轮询得 PENDING；
+    gate 周期之后所有重试拿到同一份终态裁决。"""
+    import app.quota.main as qmain
+    import app.common.config as cfg
+    monkeypatch.setattr(cfg, "QUOTA_ROLE", "collector")
+    assert qmain._gate_enabled() is False
+    with TestClient(app) as c:
+        r = c.post("/quota/holds", json={
+            "serial": "sp1", "account": "acct", "rule_name": "r1",
+            "occurred_at": at(2026, 9, 16, 4).isoformat(), "amount": 60})
+        assert r.status_code == 202 and r.json()["status"] == "NEW"
+        # 立刻读：裁决尚未产出（明确 PENDING，而不是读不到或误放行）
+        pv = c.get("/quota/holds/sp1/verdict")
+        assert pv.status_code == 202 and pv.json()["verdict"] == "PENDING"
+
+    # 独立 gate 组件推进一个周期
+    assert worker.gate_tick("gate-separate")["admitted"] == 1
+
+    with TestClient(app) as c:
+        v = c.get("/quota/holds/sp1/verdict").json()
+        assert (v["verdict"], v["status"]) == ("GRANTED", "HELD")
+        tok = v["token"]
+        # 反复询问（网络抖动重发）：同一份答复
+        assert c.get("/quota/holds/sp1/verdict").json()["token"] == tok
+
+    # 接入组件即使恢复 gate 职责后遇到重投：回放既有裁决，绝不二次占用
+    monkeypatch.setattr(cfg, "QUOTA_ROLE", "all")
+    assert qmain._gate_enabled() is True
+    with TestClient(app) as c:
+        r = c.post("/quota/holds", json={
+            "serial": "sp1", "account": "acct", "rule_name": "r1",
+            "occurred_at": at(2026, 9, 16, 4).isoformat(), "amount": 60})
+        assert r.status_code == 200
+        assert r.json()["duplicate"] is True
+        assert r.json()["verdict"]["token"] == tok
+        with SessionLocal() as s:
+            assert s.query(QuotaHold).filter_by(serial="sp1").count() == 1
+
+
+def test_disconnected_client_leaves_no_unreleasable_freeze(svc):
+    """客户端拿到通行令后连接断开：占用仍受 TTL 保护；主动放弃或超时回收
+    都能解除，绝不留下无法归还的冻结。"""
+    with SessionLocal() as s:
+        r = qs.submit_and_adjudicate_hold(
+            s, serial="dc1", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4), amount=100, ttl_s=10)
+        s.commit()
+        tok = r["verdict"]["token"]
+    # “断线”期间另一客户端想占满同一池：被挡住，阈值不破
+    with SessionLocal() as s:
+        blocked = qs.submit_and_adjudicate_hold(
+            s, serial="dc2", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4, 0, 1), amount=1)
+        s.commit()
+        assert blocked["verdict"]["reject_reason"] == "quota_exceeded"
+
+    # 客户端恢复后凭流水取回同一张通行令（裁决不翻转）
+    with SessionLocal() as s:
+        assert qs.get_hold_verdict(s, "dc1")["token"] == tok
+
+    # 超时回收：冻结解除，余额重新可花
+    with SessionLocal() as s:
+        rels = qs.reap_expired(s, now=at(2026, 9, 16, 4, 0, 11))
+        s.commit()
+        assert len(rels) == 1 and rels[0]["batch_date"] == "2026-09-16"
+        after = qs.submit_and_adjudicate_hold(
+            s, serial="dc3", account="acct", rule_name="r1",
+            occurred_at=at(2026, 9, 16, 4, 0, 12), amount=100)
+        s.commit()
+        assert after["verdict"]["verdict"] == "GRANTED"
+    # 已归还的旧裁决仍然可读、通行令不变（裁决历史不可变）
+    with SessionLocal() as s:
+        old = qs.get_hold_verdict(s, "dc1")
+        assert old["token"] == tok and old["status"] == "RELEASED"
+
+
+def _live_quota_server():
+    import socket
+    import threading
+    import uvicorn
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(cfg)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    import time
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.02)
+    return server, f"http://127.0.0.1:{port}"
+
+
+def test_http_concurrent_clients_never_break_threshold(svc):
+    """多客户端经真实 HTTP 同时争用：15 × 10 抢 100，恰好 10 张通行令，
+    每条 GRANTED 的通行令两两不同；总量绝不破线。"""
+    import httpx
+    server, base = _live_quota_server()
+    try:
+        results, barrier = [], threading.Barrier(15)
+
+        def client(i):
+            body = {"serial": f"http{i:02d}", "account": "acct",
+                    "rule_name": "r1",
+                    "occurred_at": at(2026, 9, 16, 4).isoformat(), "amount": 10}
+            barrier.wait()
+            r = httpx.post(f"{base}/quota/holds", json=body, timeout=30)
+            assert r.status_code == 200
+            results.append(r.json()["verdict"])
+            # 立刻再问一次：同一份答复
+            again = httpx.get(
+                f"{base}/quota/holds/http{i:02d}/verdict", timeout=30).json()
+            assert again["verdict"] == r.json()["verdict"]["verdict"]
+
+        threads = [threading.Thread(target=client, args=(i,)) for i in range(15)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        server.should_exit = True
+
+    granted = [v for v in results if v["verdict"] == "GRANTED"]
+    rejected = [v for v in results if v["verdict"] == "REJECTED"]
+    assert len(granted) == 10 and len(rejected) == 5
+    assert sum(v["amount"] for v in granted) == 100
+    assert {v["reject_reason"] for v in rejected} == {"quota_exceeded"}
+    assert len({v["token"] for v in granted}) == 10  # 通行令唯一
+    with SessionLocal() as s:
+        assert sum(h.amount for h in s.query(QuotaHold)
+                   .filter_by(status="HELD").all()) == 100
+
+
 # ---------------------------------------------------------------------------
 # HTTP 端到端（三组件经 /quota/tick 手动驱动，便于断言顺序）
 # ---------------------------------------------------------------------------
 
 def test_api_end_to_end(svc):
+    # 占用 TTL 按墙钟回收，HTTP 端到端用当前时刻，避免手推 gate 周期时
+    # reap_expired 把 2026 固定日期的未结占用当作超时归还
+    now_iso = datetime.now(tz=SH).replace(microsecond=0).isoformat()
     with TestClient(app) as c:
-        # 重投消除
+        # 重投消除；gate 在同进程时同步给出终态裁决（不再需要手推 gate 周期）
         body = {"serial": "h1", "account": "acct", "rule_name": "r1",
-                "occurred_at": at(2026, 9, 16, 4).isoformat(), "amount": 60}
-        assert c.post("/quota/holds", json=body).json()["duplicate"] is False
-        assert c.post("/quota/holds", json=body).json()["duplicate"] is True
+                "occurred_at": now_iso, "amount": 60}
+        r1 = c.post("/quota/holds", json=body)
+        assert r1.status_code == 200
+        assert r1.json()["duplicate"] is False
+        v1 = r1.json()["verdict"]
+        assert (v1["verdict"], v1["status"]) == ("GRANTED", "HELD")
+        assert len(v1["token"]) == 64
+        r2 = c.post("/quota/holds", json=body).json()
+        assert r2["duplicate"] is True
+        # 网络抖动后再次询问 / 重投，拿到的是同一份裁决与同一张通行令
+        assert r2["verdict"]["token"] == v1["token"]
+        vq = c.get("/quota/holds/h1/verdict").json()
+        assert vq["token"] == v1["token"]
 
-        r = c.post("/quota/tick/gate").json()
-        assert r["admitted"] == 1
+        # 60 已占用：再要 50 立即确定性驳回（不必等任何工作周期）
+        rej = c.post("/quota/holds", json={
+            "serial": "h1b", "account": "acct", "rule_name": "r1",
+            "occurred_at": now_iso, "amount": 50}).json()
+        assert (rej["verdict"]["verdict"],
+                rej["verdict"]["reject_reason"]) == ("REJECTED", "quota_exceeded")
+        assert "token" not in rej["verdict"]
+        assert c.get("/quota/holds/h1b/verdict").json()["reject_reason"] == \
+            "quota_exceeded"
+
+        # gate 周期已无事件可处理（同步路径把事件落成了 DONE），也不回收未过期占用
+        assert c.post("/quota/tick/gate").json()["admitted"] == 0
         assert c.get("/quota/holds", params={"serial": "h1"}).json()[0][
             "status"] == "HELD"
 
+        voucher_at = (datetime.now(tz=SH).replace(microsecond=0)
+                      + timedelta(minutes=1)).isoformat()
         c.post("/quota/vouchers", json={
             "serial": "h1", "account": "acct", "rule_name": "r1",
-            "occurred_at": at(2026, 9, 16, 4, 1).isoformat(), "amount": 40})
+            "occurred_at": voucher_at, "amount": 40})
         r = c.post("/quota/tick/accountant").json()
         assert r["settled"] == 1
 
+        batch_date = datetime.now(tz=SH).date().isoformat()
         u = c.get("/quota/usage/acct",
                   params={"scope_rule": "r1",
-                          "batch_date": "2026-09-16"}).json()
+                          "batch_date": batch_date}).json()
         assert u["scopes"][0]["available"] == 60
 
         # trace 可查
@@ -753,12 +1085,12 @@ def test_api_end_to_end(svc):
 
         # 封账后晚到凭证 -> 挂起 -> 财务补账
         c.post("/quota/batches/seal", json={
-            "account": "acct", "batch_date": "2026-09-16"})
-        page = c.get("/quota/batches/acct/2026-09-16/page").json()
+            "account": "acct", "batch_date": batch_date})
+        page = c.get(f"/quota/batches/acct/{batch_date}/page").json()
         assert page["immutable"] is True
         c.post("/quota/vouchers", json={
             "serial": "h2", "account": "acct", "rule_name": "r1",
-            "occurred_at": at(2026, 9, 16, 6).isoformat(), "amount": 7})
+            "occurred_at": voucher_at, "amount": 7})
         c.post("/quota/tick/accountant")
         adj = c.get("/quota/adjustments", params={"status": "PENDING"}).json()
         assert [a["serial"] for a in adj] == ["h2"]

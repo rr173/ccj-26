@@ -460,6 +460,16 @@ class QuotaBatch(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
+class QuotaMeta(Base):
+    """台账内部键值元数据（如占用通行令的 HMAC 签名密钥，按库持久化）。"""
+
+    __tablename__ = "quota_meta"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(String(256), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class QuotaInboxEvent(Base):
     """采集端入站事件（凭证 / 占用申请 / 放弃）。只追加。
 

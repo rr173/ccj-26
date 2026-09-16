@@ -29,7 +29,7 @@ def clean_db():
     with SessionLocal() as s:
         for t in (models.QuotaVoucher, models.QuotaHold, models.QuotaInboxEvent,
                   models.QuotaBatch, models.QuotaVersion, models.QuotaRule,
-                  models.QuotaAccount,
+                  models.QuotaAccount, models.QuotaMeta,
                   models.DebugEpoch, models.DebugCommand, models.DebugEvent,
                   models.DebugFrame, models.DebugBranch, models.DebugSession,
                   models.ProposalEvent, models.Review, models.Proposal,

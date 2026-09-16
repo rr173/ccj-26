@@ -1,11 +1,17 @@
 """资源消耗台账与周期限额 —— 核心领域逻辑（与 FastAPI 解耦，便于单测）。
 
 生命周期（同一业务流水 serial 贯穿）：
-  hold（判定开始，预估量先占用余额）
+  hold（判定开始，前置门禁**同步**给出唯一确定裁决：GRANTED+通行令 / REJECTED）
     └─ voucher（判定结束的真实消耗凭证）→ settlement（按真实消耗销账，差额补退）
     └─ abort / 超时未结束             → release（占用归还到产生周期）
 
 领域规则：
+
+- **先裁决后计算 / 裁决可重复获取**：gate 所在进程的 submit_and_adjudicate_hold
+  在一个写事务内完成采集去重 + 门禁裁决并返回终态（含 HMAC 通行令）；同 serial
+  重发或 GET verdict 永远取回同一份答复。gate 分离部署时仅入箱（202 PENDING），
+  由独立 gate 周期裁决，inline 与工作器以「NEW→PROCESSING 认领 + 限额行锁 +
+  serial 唯一」三重互斥，绝不可能出现两个裁决或两笔占用。
 
 - **重投消除 / 乱序接纳**：采集箱 (serial, event_type) 唯一，重复提交返回 duplicate
   而不重复入账；凭证先于占用到达时凭证保持 PENDING，后续周期自动配对销账。
@@ -24,18 +30,24 @@
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from functools import wraps
 
+from sqlalchemy.exc import IntegrityError
+
 from . import events
 from .config import QUOTA_DEFAULT_TTL_S, QUOTA_MAX_TTL_S
 from .db import immediate
 from .models import (QuotaAccount, QuotaAdjustment, QuotaAdjustmentEntry,
-                     QuotaBatch, QuotaHold, QuotaInboxEvent, QuotaPage,
-                     QuotaPageLine, QuotaRelease, QuotaRule, QuotaSettlement,
-                     QuotaVersion, QuotaVoucher, utcnow)
+                     QuotaBatch, QuotaHold, QuotaInboxEvent, QuotaMeta,
+                     QuotaPage, QuotaPageLine, QuotaRelease, QuotaRule,
+                     QuotaSettlement, QuotaVersion, QuotaVoucher, utcnow)
 
 SHARED_SCOPE = ""          # 共享池作用域（多条规则共用一份限额）
 EVENT_HOLD = "hold"
@@ -438,57 +450,316 @@ def process_hold_event(session, ev: QuotaInboxEvent,
 
 def _process_hold_event(session, ev: QuotaInboxEvent, now) -> dict:
     now = now or utcnow()
-    session.info["_quota_writing"] = True
     existing = session.query(QuotaHold).filter_by(serial=ev.serial).first()
-    if existing:  # 重放（崩溃恢复后）：幂等
+    if existing:  # 重放（崩溃恢复后）：幂等回放首次裁决
         ev.status, ev.processed_at = "DONE", now
         return hold_dict(existing)
+    try:
+        hold = _adjudicate_hold(session, ev, now)
+    except QuotaError as err:
+        # 永久性拒绝（如规则未注册）：事件置 FAILED，可由 requeue_event 重新入队
+        ev.status, ev.last_error = "FAILED", err.code
+        raise
+    ev.status, ev.processed_at = "DONE", now
+    return hold_dict(hold)
 
+
+def _get_or_create_batch(session, acc: QuotaAccount, date_str: str) -> QuotaBatch:
+    """取/建批次行；并发首笔撞 (account,date) 唯一约束时回退读已有行。"""
+    b = _get_batch(session, acc, date_str)
+    if b is not None:
+        return b
+    sp = session.begin_nested()
+    try:
+        b = QuotaBatch(account_id=acc.id, batch_date=date_str, status=BATCH_OPEN)
+        session.add(b)
+        session.flush()
+        return b
+    except IntegrityError:
+        sp.rollback()
+        return _get_batch(session, acc, date_str, create=False)
+
+
+def _adjudicate_hold(session, ev: QuotaInboxEvent, now: datetime) -> QuotaHold:
+    """门禁裁决核心：在当前写事务内「锁限额版本行 -> 读占用/已销账 -> 判定 ->
+    写占用（终态，含 REJECTED）」。inline 受理与 gate 工作器共用同一临界区，
+    任何交错都不可能让同一流水产生两行占用或让总量突破限额。
+
+    同一 serial 已有占用行（另一进程抢先裁决）时原样回放首次裁决，保证裁决唯一确定。
+    """
     acc = _get_account(session, ev.account)
     scope, err = _resolve_scope(session, acc, ev.rule_name)
     if err:
-        ev.status, ev.last_error = "FAILED", err.code
         raise err
-
     date_str = batch_date_for(acc, ev.occurred_at)
-    batch = _get_batch(session, acc, date_str, create=True)
+    batch = _get_or_create_batch(session, acc, date_str)
     amount = ev.payload["amount"]
     ttl_s = ev.payload.get("ttl_s", QUOTA_DEFAULT_TTL_S)
     started = ev.occurred_at
     expires = started + timedelta(seconds=ttl_s)
 
-    hold = QuotaHold(serial=ev.serial, account_id=acc.id, rule_name=ev.rule_name,
-                     scope_rule=scope, amount=amount, batch_date=date_str,
-                     ttl_s=ttl_s, started_at=started, expires_at=expires,
-                     created_by=ev.source)
-    reject = None
     if batch.status == BATCH_SEALED:
         reject = "batch_sealed"
+        v = None
     else:
         v = _lock_version(session, acc.id, scope, date_str)
+        # PG 行锁拿到后再查一次：inline 与 gate 工作器可能都已受理同一 serial
+        existing = session.query(QuotaHold).filter_by(serial=ev.serial).first()
+        if existing:
+            return existing
         if v is None:
             reject = "no_quota_limit"
         else:
             u = _usage(session, acc.id, scope, date_str)
-            if u["used_amount"] + amount > v.limit_amount:
-                reject = "quota_exceeded"
+            reject = "quota_exceeded" if u["used_amount"] + amount > v.limit_amount else None
+
+    hold = QuotaHold(serial=ev.serial, account_id=acc.id, rule_name=ev.rule_name,
+                     scope_rule=scope, amount=amount, batch_date=date_str,
+                     ttl_s=ttl_s, started_at=started, expires_at=expires,
+                     created_by=ev.source)
     if reject:
+        # 拒签也落终态行（不占任何余额）：裁决必须可重复读取。唯一约束 + 保存点
+        # 兜底与另一个裁决者的竞争，落败则回放对方裁决。
         hold.status = HOLD_REJECTED
         hold.reject_reason = reject
         hold.finished_at = now
-        session.add(hold)
-        session.flush()
+        sp = session.begin_nested()
+        try:
+            session.add(hold)
+            session.flush()
+        except IntegrityError:
+            sp.rollback()
+            existing = session.query(QuotaHold).filter_by(serial=ev.serial).first()
+            if existing:
+                return existing
+            raise
         events.audit(session, "quota", "HOLD_REJECTED", "gate", serial=ev.serial,
                      account=acc.name, scope=_scope_label(scope), batch=date_str,
                      amount=amount, reason=reject)
-    else:
+        return hold
+
+    sp = session.begin_nested()
+    try:
         session.add(hold)
         session.flush()
-        events.audit(session, "quota", "HOLD_ADMITTED", "gate", serial=ev.serial,
-                     account=acc.name, scope=_scope_label(scope), batch=date_str,
-                     amount=amount, expires_at=iso(expires))
-    ev.status, ev.processed_at = "DONE", now
-    return hold_dict(hold)
+    except IntegrityError:
+        sp.rollback()
+        existing = session.query(QuotaHold).filter_by(serial=ev.serial).first()
+        if existing:
+            return existing
+        raise
+    events.audit(session, "quota", "HOLD_ADMITTED", "gate", serial=ev.serial,
+                 account=acc.name, scope=_scope_label(scope), batch=date_str,
+                 amount=amount, expires_at=iso(expires),
+                 limit_version=v.version if v else None)
+    return hold
+
+
+# ---------------------------------------------------------------------------
+# 同步受理：采集 + 门禁在同一写事务内给出唯一确定裁决（可重复获取）
+# ---------------------------------------------------------------------------
+
+def _insert_inbox_event(session, *, serial, event_type, account, rule_name,
+                        occurred_at, payload, source, now) -> QuotaInboxEvent | None:
+    """保存点插入入站事件；撞 (serial,event_type) 唯一约束时返回 None（重投）。"""
+    ev = QuotaInboxEvent(serial=serial, event_type=event_type, account=account,
+                         rule_name=rule_name or "", occurred_at=occurred_at,
+                         payload=payload, source=source, status="NEW",
+                         received_at=now)
+    sp = session.begin_nested()
+    try:
+        session.add(ev)
+        session.flush()
+        return ev
+    except IntegrityError:
+        sp.rollback()
+        return None
+
+
+@_write_tx
+def submit_and_adjudicate_hold(session, *, serial: str, account: str,
+                               rule_name: str, occurred_at: datetime,
+                               amount: int, ttl_s: int | None = None,
+                               source: str = "http",
+                               now: datetime | None = None) -> dict:
+    """占用申请「采集去重 + 前置门禁」一个写事务内完成，直接给出终态裁决。
+
+    与「事件先进采集箱、再由独立 gate 周期认领处理」是同一套临界区与同一份
+    落库结果：本函数产出的 DONE 事件 gate 周期会直接跳过，反之亦然。
+    返回 {"duplicate":..., "verdict":...}。
+    """
+    now = now or utcnow()
+    if not serial or not isinstance(serial, str):
+        raise QuotaError("invalid_serial", 422)
+    payload = _validate_payload(EVENT_HOLD,
+                                {"amount": amount,
+                                 **({"ttl_s": ttl_s} if ttl_s is not None else {})})
+    occurred_at = as_utc(occurred_at)
+    acc = _get_account(session, account)
+
+    ev = (session.query(QuotaInboxEvent)
+          .filter_by(serial=serial, event_type=EVENT_HOLD).first())
+    duplicate = ev is not None
+    if ev is None:
+        ev = _insert_inbox_event(session, serial=serial, event_type=EVENT_HOLD,
+                                 account=acc.name, rule_name=rule_name,
+                                 occurred_at=occurred_at, payload=payload,
+                                 source=source, now=now)
+        if ev is not None:
+            events.audit(session, "quota", "EVENT_RECEIVED", None, serial=serial,
+                         type=EVENT_HOLD, account=account, rule=rule_name,
+                         event_id=ev.id, source=source, adjudicated_inline=True)
+        else:  # 并发提交：另一事务刚插入（提交后可见）
+            ev = (session.query(QuotaInboxEvent)
+                  .filter_by(serial=serial, event_type=EVENT_HOLD).one())
+            duplicate = True
+    if duplicate:
+        if ev.payload != payload or ev.account != account or ev.rule_name != rule_name:
+            raise QuotaError("serial_conflict", 409, serial=serial,
+                             event_type=EVENT_HOLD,
+                             hint="同一流水号+事件类型重投但内容不一致")
+
+    hold = session.query(QuotaHold).filter_by(serial=serial).first()
+    if hold is None and ev.status == "NEW" and not duplicate:
+        # 与独立 gate 工作器之间也要互斥：原子 NEW->PROCESSING 认领。
+        # CAS 落败说明 gate 已认领该事件，本事务只等待其裁决（PENDING），
+        # 绝不自行下判，避免同一流水两个裁决者。
+        claimed = (session.query(QuotaInboxEvent)
+                   .filter(QuotaInboxEvent.id == ev.id,
+                           QuotaInboxEvent.status == "NEW")
+                   .update({"status": "PROCESSING", "claimed_by": source,
+                            "attempts": QuotaInboxEvent.attempts + 1},
+                           synchronize_session=False))
+        if claimed:
+            hold = _adjudicate_hold(session, ev, now)
+    # FAILED：gate 已永久拒绝（如规则未注册），无占用行 ——
+    # 走 _event_failure_verdict 把失败原因原样、可重复地返回；
+    # 未抢到认领 / PROCESSING：等待 gate 裁决完成，落到 pending 分支。
+    if hold is not None:
+        ev.status, ev.processed_at = "DONE", now
+        verdict = hold_verdict(session, hold)
+    elif ev.status == "FAILED":
+        verdict = _event_failure_verdict(ev)
+    else:
+        verdict = {"serial": serial, "verdict": "PENDING", "decided": False,
+                   "event_status": ev.status,
+                   "hint": "门禁正在裁决，请稍后按同一 serial 重试本查询"}
+    return {"duplicate": duplicate, "verdict": verdict}
+
+
+def get_hold_verdict(session, serial: str) -> dict:
+    """按流水号读取占用裁决。终态裁决（通行/拒签）任何时候重复读取都是同一份；
+    裁决尚未产出（gate 组件分离运转）时返回 pending。
+
+    事件永久失败（如规则未注册）作为确定性拒签返回，客户端无需再等待。
+    """
+    hold = session.query(QuotaHold).filter_by(serial=serial).first()
+    if hold is not None:
+        return hold_verdict(session, hold)
+    ev = (session.query(QuotaInboxEvent)
+          .filter_by(serial=serial, event_type=EVENT_HOLD).first())
+    if ev is None:
+        raise QuotaError("verdict_not_found", 404, serial=serial)
+    if ev.status == "FAILED":
+        return _event_failure_verdict(ev)
+    return {"serial": serial, "verdict": "PENDING", "decided": False,
+            "hint": "门禁尚未裁决，请稍后按同一 serial 重试本查询"}
+
+
+def _event_failure_verdict(ev: QuotaInboxEvent) -> dict:
+    return {"serial": ev.serial, "verdict": "REJECTED", "decided": True,
+            "reject_reason": ev.last_error or "rejected",
+            "status": HOLD_REJECTED, "hold": None}
+
+
+# ---------------------------------------------------------------------------
+# 通行令：裁决内容 HMAC-SHA256 签名，确定且可重复获取
+# ---------------------------------------------------------------------------
+
+_VERDICT_SECRET_KEY = "hold_verdict_secret"
+
+
+def _verdict_secret(session) -> bytes:
+    """通行令签名密钥：优先 QUOTA_VERDICT_SECRET（多实例部署共享同一密钥），
+    否则按库生成并持久化一个随机密钥（任一组件、任一重启读到的都是同一份）。"""
+    env_secret = os.getenv("QUOTA_VERDICT_SECRET")
+    if env_secret:
+        return env_secret.encode()
+    row = session.get(QuotaMeta, _VERDICT_SECRET_KEY)
+    if row is None:
+        sp = session.begin_nested()
+        try:
+            row = QuotaMeta(key=_VERDICT_SECRET_KEY,
+                            value=secrets.token_hex(32))
+            session.add(row)
+            session.flush()
+        except IntegrityError:
+            sp.rollback()
+            row = session.get(QuotaMeta, _VERDICT_SECRET_KEY)
+    return row.value.encode()
+
+
+def _token_time(dt: datetime | None) -> str:
+    """通行令时间字段的稳定字面量：统一 UTC（Z 结尾），不受 SQLite 往返丢
+    时区偏移的影响 —— 同一裁决无论何时重取，签文一致。"""
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:  # SQLite 读回的 naive 值按 UTC 解释（落库前已转 UTC）
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _hold_verdict_kind(hold: QuotaHold) -> str:
+    """裁决种类只在拒签/通过二选一时刻确定，此后 HELD→SETTLED/RELEASED
+    不改变「曾通过」这一裁决（通行令一经签发不可翻转）。"""
+    return "REJECTED" if hold.status == HOLD_REJECTED else "GRANTED"
+
+
+def verdict_token(session, hold: QuotaHold) -> str:
+    """对一笔占用的确定性裁决内容签名，作为客户端启动后续计算所需的通行令。
+
+    签文只含裁决一刻即固定的字段（不含后续生命周期状态）：同一流水
+    （同一裁决）无论何时、经哪个组件、在销账/归还之后重取，签文完全一致。
+    """
+    canonical = "|".join((
+        "quota-hold-v1",
+        hold.serial,
+        str(hold.account_id),
+        hold.scope_rule,
+        str(hold.amount),
+        hold.batch_date,
+        _hold_verdict_kind(hold),
+        hold.reject_reason or "",
+        _token_time(hold.started_at),
+        _token_time(hold.expires_at),
+    ))
+    return hmac.new(_verdict_secret(session), canonical.encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def hold_verdict(session, hold: QuotaHold) -> dict:
+    """把占用行序列化为裁决：HELD -> 通行令（GRANTED）；REJECTED -> 确定性拒签。
+
+    HELD 之后进入 SETTLED/RELEASED 也回放同一通行令（裁决一旦给出不可翻转）。
+    """
+    admitted = hold.status != HOLD_REJECTED
+    out = {
+        "serial": hold.serial,
+        "verdict": "GRANTED" if admitted else "REJECTED",
+        "decided": True,
+        "status": hold.status,
+        "reject_reason": hold.reject_reason,
+        "amount": hold.amount,
+        "scope": _scope_label(hold.scope_rule),
+        "batch_date": hold.batch_date,
+    }
+    if admitted:
+        out.update({
+            "token": verdict_token(session, hold),
+            "expires_at": iso(hold.expires_at),
+            "hint": "凭通行令启动后续计算；断线重连/重试凭同一 serial 取回同一通行令",
+        })
+    return out
 
 
 def _release_hold(session, hold: QuotaHold, reason: str, now: datetime,

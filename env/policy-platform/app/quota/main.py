@@ -8,7 +8,9 @@
 
 API：
   管理    POST /quota/accounts、POST /quota/rules、POST /quota/limits
-  采集    POST /quota/holds、POST /quota/vouchers、POST /quota/aborts
+  采集    POST /quota/holds（gate 在本进程时同步返回 200 终态裁决+通行令；
+          gate 分离时 202 入箱）、GET /quota/holds/{serial}/verdict、
+          POST /quota/vouchers、POST /quota/aborts
   核算    POST /quota/batches/seal、POST /quota/batches/auto-seal、
           GET  /quota/batches/{account}/{date}/page
   财务    GET  /quota/adjustments、POST /quota/adjustments/{id}/decision、
@@ -22,9 +24,11 @@ import socket
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from ..common import events, quota_service as qs, quota_worker as worker
-from ..common.config import QUOTA_ROLE, SERVICE_NAME
+from ..common import config as cfg
+from ..common.config import SERVICE_NAME
 from ..common.db import SessionLocal, init_db
 from ..common.routers import audit_router
 from ..common.schemas import (QuotaAbortSubmit, QuotaAccountCreate,
@@ -37,13 +41,13 @@ from ..common.schemas import (QuotaAbortSubmit, QuotaAccountCreate,
 @asynccontextmanager
 async def lifespan(app):
     init_db()
-    roles = worker.parse_roles(QUOTA_ROLE)
+    roles = worker.parse_roles(cfg.QUOTA_ROLE)
     with SessionLocal() as s:
         events.audit(s, "quota", "SERVICE_STARTED", None,
                      hostname=socket.gethostname(), pid=os.getpid(),
                      roles=roles)
         s.commit()
-    worker.start(QUOTA_ROLE)
+    worker.start(cfg.QUOTA_ROLE)
     yield
     worker.stop()
 
@@ -59,10 +63,16 @@ def _call(fn, *args, **kwargs):
         raise HTTPException(e.status, e.detail())
 
 
+def _gate_enabled() -> bool:
+    # 动态读 config，便于运行时按 QUOTA_ROLE 切换（测试/同一库多角色部署）
+    from ..common import config as cfg
+    return worker.ROLE_GATE in worker.parse_roles(cfg.QUOTA_ROLE)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": SERVICE_NAME,
-            "roles": worker.parse_roles(QUOTA_ROLE)}
+            "roles": worker.parse_roles(cfg.QUOTA_ROLE)}
 
 
 # ---------- 管理：账户 / 规则 / 限额 ----------
@@ -105,11 +115,45 @@ def _submit(req, event_type, payload):
         return r
 
 
-@app.post("/quota/holds", status_code=202)
+@app.post("/quota/holds")
 def submit_hold(req: QuotaHoldSubmit):
-    return _submit(req, qs.EVENT_HOLD,
-                   {"amount": req.amount,
-                    **({"ttl_s": req.ttl_s} if req.ttl_s is not None else {})})
+    """占用申请。
+
+    - 本进程承担 gate 职责（默认 all / 含 gate）：采集去重 + 前置门禁在**同一个
+      写事务**内完成，直接返回终态裁决（200）——通过则带唯一、可重复获取的
+      `verdict.token`（通行令），拒绝则 `verdict=REJECTED` + reject_reason，
+      客户端拿到裁决前不得启动后续计算。
+    - gate 分离部署（QUOTA_ROLE 不含 gate）：仅入采集箱（202），客户端凭 serial
+      轮询 GET /quota/holds/{serial}/verdict，直到拿到同一份终态裁决。
+    """
+    payload = {"amount": req.amount,
+               **({"ttl_s": req.ttl_s} if req.ttl_s is not None else {})}
+    with SessionLocal() as s:
+        if _gate_enabled():
+            r = _call(qs.submit_and_adjudicate_hold,
+                      s, serial=req.serial, account=req.account,
+                      rule_name=req.rule_name, occurred_at=req.occurred_at,
+                      amount=req.amount, ttl_s=req.ttl_s, source="http")
+            s.commit()
+            return r
+        r = _call(qs.submit_event,
+                  s, serial=req.serial, event_type=qs.EVENT_HOLD,
+                  account=req.account, rule_name=req.rule_name,
+                  occurred_at=req.occurred_at, payload=payload, source="http")
+        s.commit()
+        return JSONResponse(status_code=202, content=r)
+
+
+@app.get("/quota/holds/{serial}/verdict")
+def hold_verdict(serial: str):
+    """按流水号取回占用裁决：终态裁决（通行令/拒签）任何重试都返回同一份；
+    gate 尚未裁决（组件分离运转）时返回 202 PENDING。"""
+    with SessionLocal() as s:
+        r = _call(qs.get_hold_verdict, s, serial)
+        s.commit()  # 首次取通行令时可能在 quota_meta 内建签名密钥，一并落库
+        if not r.get("decided"):
+            return JSONResponse(status_code=202, content=r)
+        return r
 
 
 @app.post("/quota/vouchers", status_code=202)
