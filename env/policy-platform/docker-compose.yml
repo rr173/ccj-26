@@ -54,5 +54,17 @@ services:
     ports:
       - "8003:8003"
 
+  debugger:
+    build: .
+    command: ["uvicorn", "app.debugger.main:app", "--host", "0.0.0.0", "--port", "8004"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://policy:policy@db:5432/policy
+      SERVICE_NAME: debugger
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8004:8004"
+
 volumes:
   pgdata:

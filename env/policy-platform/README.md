@@ -1,8 +1,9 @@
 # 策略编译与执行平台（policy-platform）
 
-策略编辑、编译校验、运行时查询三个**可独立部署**的服务。策略由可复用片段（fragment）
+策略编辑、编译校验、运行时查询、**逐步调试**四个**可独立部署**的服务。策略由可复用片段（fragment）
 组成，发布前解析依赖图、检测循环，生成**带版本的不可变产物**；运行时按请求上下文
-选版执行，失败按安全回退规则降级，全程可审计。
+选版执行，失败按安全回退规则降级，全程可审计。维护者可对一次输入创建**可暂停、
+可恢复、可分叉**的逐步调试会话。
 
 ## 架构
 
@@ -16,22 +17,25 @@
                   │            PostgreSQL                 │
                   │  fragments / policies / artifacts     │
                   │  policy_deps / audit_events / decisions│
+                  │  debug_sessions / debug_branches /    │
+                  │  debug_frames / debug_events / ...     │
                   └────────────▲─────────────────────────┘
-                               │ 读产物（启动预热 + 缓存）
-            ┌──────────────────┴───┐
-  查询 ────▶│  runtime   :8003     │
-            └──────────────────────┘
+                               │ 读产物（启动预热 + 缓存）   │ 固定版本快照
+            ┌──────────────────┴───┐              ┌────────┴────────┐
+  查询 ────▶│  runtime   :8003     │   调试 ─────▶│  debugger :8004 │
+            └──────────────────────┘              └─────────────────┘
 ```
 
 - **editor**：片段/策略 CRUD、发布入口、依赖链查询、**变更提案与评审工作流**。片段更新后调用 compiler 做**增量重编译**。
 - **compiler**：依赖图解析、循环检测、拓扑排序、生成不可变版本产物；撤销版本。
 - **runtime**：按 `min_version` 选版执行；节点未加载/超时按回退规则降级；记录决策日志。
-- 三个服务无共享内存状态，各自独立扩缩容；共享存储只有数据库。
+- **debugger**：针对一次输入的**逐步调试会话**：固定产物版本 + 脱敏输入、断点、租约、分叉与逐节点比较。
+- 四个服务无共享内存状态，各自独立扩缩容；共享存储只有数据库。
 
 ## 快速开始
 
 ```bash
-docker compose up --build        # db + compiler + editor + runtime
+docker compose up --build        # db + compiler + editor + runtime + debugger
 ./scripts/demo.sh                # 端到端演示（需要 jq）
 ```
 
@@ -39,10 +43,11 @@ docker compose up --build        # db + compiler + editor + runtime
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/                       # 60 个测试
+python -m pytest tests/                       # 84 个测试
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.compiler.main:app --port 8002 &
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.editor.main:app --port 8001 &
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.runtime.main:app --port 8003 &
+DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.debugger.main:app --port 8004 &
 ```
 
 ## 核心机制
@@ -135,6 +140,76 @@ DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.runtime.main:app --port 80
 editor 重启后：复位崩溃残留的 `APPLYING`，立即跑一个周期（宕机期间到点的立即生效），
 未到点的预约继续等到点，等待中的评审继续可处理。调度周期由 `SCHEDULER_INTERVAL_MS` 控制。
 
+### 逐步调试（debugger :8004）
+
+让策略维护者针对**一次输入**创建可暂停、可恢复、可分叉的逐步调试会话。调试器只读
+产物、不参与运行时选版与回退；所有状态都在数据库，可独立扩缩容、随时重启。
+
+**会话创建即固化（`POST /debug/sessions`）**
+- **固定产物版本**：默认取最新未撤销版本，也可 `version` 指定；创建时把节点图
+  `nodes/topo/entry/dep_chain/hash` **整体快照**进会话。之后即使产物被撤销或发布了
+  新版本，调试始终走快照；会话状态里的 `artifact.version_status` 实时标注
+  `active / outdated / revoked / missing` 与 `newer_versions`、撤销原因。
+- **输入脱敏后落库**：递归按敏感键名（`password/token/secret/email/phone/...`，
+  可用 `secret_keys` 追加）把值替换为 `***REDACTED***`；原始输入**不落库**，
+  只保留键名 + SHA-256 + 大小（`input_redaction.original_input_summary`），
+  并报告每个被掩码的 JSON 路径。
+- 创建者即第一任租约持有人，返回一次性 `lease.token`（仅创建/接管响应里出现）。
+
+**按实际求值顺序推进**
+- `POST .../step`：执行**恰好一个**拓扑节点后停下（同步）。
+- `POST .../continue`：进入 `running`，后台线程推进到**下一断点 / 暂停请求 /
+  错误 / 完成**（返回 202，轮询分支状态）。每个节点提交一次，崩溃只丢当前节点。
+- 任意停止点的分支视图含：`current`（节点定义、执行前入参 `args_in`）、
+  `remaining_path`（剩余 topo 节点）、每个已执行节点的 `frames`（入参/结果/耗时）。
+
+**断点**（创建时给定或 `PUT .../breakpoints` 整体替换，可按分支不同）
+- `{"type":"node","node":"risk_base#10"}`：按节点 id；
+- `{"type":"op","op":"div"}`：按算子类型；
+- `{"type":"condition","expr":{...DSL...},"node":null}`：DSL 布尔表达式，对**输入**
+  求值（不允许 `ref`）；可选 `node` 限定只在该节点前判断，否则每个节点执行前都判断。
+- 断点在节点**执行前**命中；非法节点/算子/表达式在设置时即 422。
+
+**确定性错误停成错误帧**：缺输入（`missing_input`）、除零等 DSL 错误、
+`op not loaded`（运行时缺该算子）都在出错节点形成 `error frame`：分支转 `error`、
+游标停在该节点（`remaining_path` 含它）、记录错误类型与消息，**会话不消失**；
+此后只能从该点 `fork`（改输入重试）或结束会话。
+
+**分叉（`POST .../fork`）**
+- 只能从停止点（暂停/错误/完成）分叉；`input_patch` 是顶层输入覆盖（键值覆盖、
+  `null` 删除键），新增值同样脱敏；子分支继承断点、从节点 0 **用新输入重放**。
+- **父分支历史永不改写**：`debug_frames` 对 `(session, branch, index)` 唯一、只追加。
+- `GET .../compare?a=main&b=<child>`：按 topo 下标逐节点对齐比较中间结果与错误，
+  给出最近共同祖先和**第一处分歧**（`result` / `error` / `execution_boundary`）。
+
+**租约：同一时刻只有持有人能推进**
+- 所有写操作要求 `actor + token` 且租约未到期；其他人（token/持有人不符）只能 GET，
+  写操作返回 409 `not_lease_holder`。
+- `POST .../lease` 续租（token 不变）；租约到期后任何人可
+  `POST .../lease/takeover` 接管（换发新 token）。
+- **接管后旧持有人的命令一律拒绝**（其旧 token 不再匹配）；正在 `continue` 的后台
+  线程在下一**节点边界**检测到 token 变化/到期即停（时间线 `reason=lease_lost`），
+  不会多执行节点；新持有人随后可从该停止点继续。
+- 默认 TTL 60s（`DEBUG_LEASE_TTL_S`，上限 `DEBUG_LEASE_MAX_S`）。
+
+**幂等与防乱序**
+- 变更命令可带 `cmd_id`：同一会话内相同 `cmd_id+actor+command` **回放首次响应**，
+  重复命令**不会多推进一步**（返回体带 `replayed:true`）；cmd_id 被不同命令复用 →
+  409 `cmd_id_conflict`。
+- `step/fork` 带分支级单调 `seq`；乱序/重放旧序号 → 409 `unexpected_seq`，
+  响应始终带 `expected_seq`。
+
+**长暂停与重启**：分支位置、帧、租约、断点、输入全部在库。长时间暂停后继续仍从原
+节点走；debugger 重启时把「所属进程心跳已死」的残留 `running` 分支复位为 `paused`
+（基于 `debug_epochs` 心跳，**不会**误复位同库其它存活实例正在推进的分支），事件
+`reason=service_restart`。
+
+**完整时间线（`GET .../timeline`）**：追加式 `debug_events` 记录每次
+创建 / 推进（advanced，含节点结果与耗时）/ 暂停（breakpoint/manual/lease_lost/
+service_restart）/ 接管（lease_taken_over）/ 续租 / 分叉（forked，含 changed_keys）/
+错误 / 完成 / 结束，并附各分支全部节点的当时输入、结果、错误帧；配合 `compare`
+定位分支间第一处分歧。
+
 ## DSL 参考
 
 ```jsonc
@@ -169,6 +244,17 @@ endswith lower upper concat len abs min max round coalesce if`，以及测试辅
 **runtime :8003**
 `POST /query`（`{policy, min_version, inputs, timeout_ms, strict_min_version, request_id}`）、
 `GET /decisions`、`GET /decisions/{id}`、`GET /cache`（节点加载状态）、`GET /audit`
+
+**debugger :8004**
+`POST /debug/sessions`（`{policy, inputs, actor, version?, title?, breakpoints?, secret_keys?, lease_ttl_s?}`）、
+`GET /debug/sessions`、`GET /debug/sessions/{id}`、`POST /debug/sessions/{id}/end`、
+`POST /debug/sessions/{id}/step`、`POST /debug/sessions/{id}/continue`、
+`POST /debug/sessions/{id}/pause`、`PUT /debug/sessions/{id}/breakpoints`、
+`POST /debug/sessions/{id}/fork`、
+`GET /debug/sessions/{id}/branches/{branch}`、
+`GET /debug/sessions/{id}/compare?a=&b=`、`GET /debug/sessions/{id}/timeline`、
+`POST /debug/sessions/{id}/lease`（续租）、
+`POST /debug/sessions/{id}/lease/takeover`（到期后接管）、`GET /audit`
 
 ## 设计取舍
 

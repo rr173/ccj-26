@@ -19,7 +19,9 @@ from app.common.db import SessionLocal, init_db  # noqa: E402
 def clean_db():
     init_db()
     with SessionLocal() as s:
-        for t in (models.ProposalEvent, models.Review, models.Proposal,
+        for t in (models.DebugEpoch, models.DebugCommand, models.DebugEvent,
+                  models.DebugFrame, models.DebugBranch, models.DebugSession,
+                  models.ProposalEvent, models.Review, models.Proposal,
                   models.ApprovalConfig,
                   models.Decision, models.AuditEvent, models.PolicyDep,
                   models.Artifact, models.Policy, models.Fragment):

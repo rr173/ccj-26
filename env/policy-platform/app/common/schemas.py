@@ -89,3 +89,73 @@ class ApprovalRule(BaseModel):
 class ApprovalConfigUpsert(BaseModel):
     rules: List[ApprovalRule] = Field(min_length=1)
     actor: str = "anonymous"
+
+
+# ---------- 逐步调试会话 ----------
+
+class DebugSessionCreate(BaseModel):
+    policy: str
+    inputs: dict = Field(default_factory=dict)
+    actor: str = Field(min_length=1)
+    version: Optional[int] = None              # 默认取最新未撤销版本
+    title: str = ""
+    breakpoints: List[dict] = Field(default_factory=list)
+    secret_keys: List[str] = Field(default_factory=list)  # 额外脱敏键名
+    lease_ttl_s: Optional[int] = Field(default=None, ge=1)
+
+
+class DebugStepRequest(BaseModel):
+    actor: str = Field(min_length=1)
+    token: str = Field(min_length=1)
+    branch: Optional[str] = None
+    seq: Optional[int] = None
+    cmd_id: Optional[str] = None
+
+
+class DebugContinueRequest(BaseModel):
+    actor: str = Field(min_length=1)
+    token: str = Field(min_length=1)
+    branch: Optional[str] = None
+    cmd_id: Optional[str] = None
+
+
+class DebugPauseRequest(BaseModel):
+    actor: str = Field(min_length=1)
+    token: str = Field(min_length=1)
+    branch: Optional[str] = None
+    cmd_id: Optional[str] = None
+
+
+class DebugForkRequest(BaseModel):
+    actor: str = Field(min_length=1)
+    token: str = Field(min_length=1)
+    parent_branch: Optional[str] = None
+    input_patch: dict = Field(default_factory=dict)
+    seq: Optional[int] = None
+    cmd_id: Optional[str] = None
+
+
+class DebugBreakpointsRequest(BaseModel):
+    actor: str = Field(min_length=1)
+    token: str = Field(min_length=1)
+    branch: Optional[str] = None
+    breakpoints: List[dict] = Field(default_factory=list)
+    cmd_id: Optional[str] = None
+
+
+class DebugEndRequest(BaseModel):
+    actor: str = Field(min_length=1)
+    token: str = Field(min_length=1)
+    reason: str = "ended_by_actor"
+    cmd_id: Optional[str] = None
+
+
+class DebugLeaseRequest(BaseModel):
+    actor: str = Field(min_length=1)
+    token: Optional[str] = None
+    ttl_s: Optional[int] = Field(default=None, ge=1)
+
+
+class DebugLeaseTakeoverRequest(BaseModel):
+    actor: str = Field(min_length=1)
+    ttl_s: Optional[int] = Field(default=None, ge=1)
