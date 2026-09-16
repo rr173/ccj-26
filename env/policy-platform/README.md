@@ -1,9 +1,11 @@
 # 策略编译与执行平台（policy-platform）
 
-策略编辑、编译校验、运行时查询、**逐步调试**四个**可独立部署**的服务。策略由可复用片段（fragment）
+策略编辑、编译校验、运行时查询、**逐步调试**、**资源台账与周期限额**五个
+**可独立部署**的服务。策略由可复用片段（fragment）
 组成，发布前解析依赖图、检测循环，生成**带版本的不可变产物**；运行时按请求上下文
 选版执行，失败按安全回退规则降级，全程可审计。维护者可对一次输入创建**可暂停、
-可恢复、可分叉**的逐步调试会话。
+可恢复、可分叉**的逐步调试会话。每次规则判定先占用余额、按真实消耗销账，
+批次封账后形成**只读账页**，晚到凭证经财务确认另记补账/冲账。
 
 ## 架构
 
@@ -30,7 +32,8 @@
 - **compiler**：依赖图解析、循环检测、拓扑排序、生成不可变版本产物；撤销版本。
 - **runtime**：按 `min_version` 选版执行；节点未加载/超时按回退规则降级；记录决策日志。
 - **debugger**：针对一次输入的**逐步调试会话**：固定产物版本 + 脱敏输入、断点、租约、分叉与逐节点比较。
-- 四个服务无共享内存状态，各自独立扩缩容；共享存储只有数据库。
+- **quota**：资源消耗台账与周期限额；凭证采集、前置余额门禁、批次核算三个组件可分开启动。
+- 五个服务无共享内存状态，各自独立扩缩容；共享存储只有数据库。
 
 ## 快速开始
 
@@ -43,11 +46,13 @@ docker compose up --build        # db + compiler + editor + runtime + debugger
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/                       # 84 个测试
+python -m pytest tests/                       # 115 个测试
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.compiler.main:app --port 8002 &
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.editor.main:app --port 8001 &
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.runtime.main:app --port 8003 &
 DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.debugger.main:app --port 8004 &
+# 资源台账（:8005）：三个组件可分开启动 —— QUOTA_ROLE=collector / gate / accountant
+DATABASE_URL=sqlite:///./dev.db python -m uvicorn app.quota.main:app --port 8005 &
 ```
 
 ## 核心机制
@@ -210,6 +215,55 @@ service_restart）/ 接管（lease_taken_over）/ 续租 / 分叉（forked，含
 错误 / 完成 / 结束，并附各分支全部节点的当时输入、结果、错误帧；配合 `compare`
 定位分支间第一处分歧。
 
+## 资源消耗台账与周期限额（quota :8005）
+
+为每次规则判定建立资源消耗台账与周期限额。判定生命周期（同一业务流水 `serial`
+贯穿）：**占用（判定开始，预估量先占余额）→ 凭证（判定结束真实消耗）→
+销账（差额自动补退）**；异常退出或超时则**归还占用**。
+
+```
+业务端                collector 采集            gate 前置门禁            accountant 核算
+POST /quota/holds  ──▶ 入站事件箱(去重/乱序) ──▶ 锁限额→判余额→写占用 ──▶ 配对凭证→销账
+POST /quota/vouchers──▶（同一事件箱，可先到）                          ──▶ 封账→只读账页
+POST /quota/aborts ──▶                      ──▶ 归还 / 超时回收        ──▶ 晚到挂起→财务补/冲账
+```
+
+**作用域（共用/分别设限）**：规则注册为 `mode=shared` 时并入账户共享池
+（`scope_rule=""`，多条规则共用一份限额）；`mode=dedicated` 时按规则名独立设限。
+
+- **重投消除**：采集箱 `(serial, event_type)` 唯一，重投返回 `duplicate:true`，
+  绝不重复入账；同流水同类型但内容不一致报 `serial_conflict`。
+- **乱序接纳**：凭证先于占用到达时凭证置 `PENDING`，后续核算周期自动配对；
+  放弃先到则退回队列等待占用。事件认领用 NEW→PROCESSING 的 CAS 互斥，
+  崩溃残留 PROCESSING 在启动时退回 NEW（业务写入幂等，重放安全）。
+- **时区批次**：批次 = 发生时刻在**账户时区**下的日期；占用记开始日，销账记
+  凭证发生日（跨周期销账打 `cross_period`），**归还永远回到占用产生日**
+  （跨周期未结束的占用即使两个周期后才超时回收，也回到产生它的批次）。
+- **并发不超卖**：占用在一个写事务里「锁限额版本行（PG `SELECT … FOR UPDATE`，
+  SQLite `BEGIN IMMEDIATE` 写锁）→ 读占用/已销账 → 判定 → 写占用」；
+  40 个并发门禁实例抢 100 额度的压测中恰好 10 笔通过、30 笔拒绝，总量不破线。
+- **销账唯一**：`quota_settlements.hold_serial` 唯一 + 占用行 HELD→终态 CAS，
+  同一流水多次销账只生效一次；超时回收与销账竞争时只有一方赢（落败方按
+  held=0 全额补记一次，不重复）。
+- **只读账页**：封账把当时账目整体快照成 `quota_pages + quota_page_lines`；
+  账页、账页行、销账、归还、调整分录五张表在**数据库层**由触发器拒绝
+  UPDATE/DELETE（SQLite trigger / Postgres trigger function）。封账幂等。
+- **晚到凭证**：封账后到达的凭证（含封账时仍 PENDING 的）一律置 `SUSPENDED`
+  并生成 PENDING 调整单；财务 `confirm` 后追加**补账（+）/冲账（−）分录**，
+  冲账后调整净额不得为负，**原账页永不改写**（调整在账页 `post_seal_appendix`
+  可追溯）；财务也可 `reject` 驳回。
+- **限额变更**：`POST /quota/limits` 带 `effective_from`（选定批次，含当日）；
+  版本号按生效日单调，已封账批次不允许选为生效日（不重算历史账页）。
+- **分开启动 / 中断续处理**：`QUOTA_ROLE=collector|gate|accountant`（逗号组合，
+  默认 all）。collector 另扫 `QUOTA_SPOOL_DIR` 文件台（incoming→processing→done，
+  坏文件落 `.bad:<code>` 不毒化周期）；gate 周期处理占用/放弃并 `reap_expired`
+  回收超时占用；accountant 周期配对销账、重试乱序凭证、把每个账户「本地日已过」
+  的 OPEN 批次自动封账。所有进度在数据库。
+- **可解释**：`GET /quota/usage/{account}` 逐项给出限额版本、占用量（含流水）、
+  已销账量（含流水）、已入账/待处理调整与可花余额；
+  `GET /quota/trace/{serial}` 沿唯一流水串起 采集→占用→凭证/销账→归还→
+  账页→调整 的完整时间线。
+
 ## DSL 参考
 
 ```jsonc
@@ -255,6 +309,20 @@ endswith lower upper concat len abs min max round coalesce if`，以及测试辅
 `GET /debug/sessions/{id}/compare?a=&b=`、`GET /debug/sessions/{id}/timeline`、
 `POST /debug/sessions/{id}/lease`（续租）、
 `POST /debug/sessions/{id}/lease/takeover`（到期后接管）、`GET /audit`
+
+**quota :8005**（`QUOTA_ROLE=collector,gate,accountant` 可分开启动）
+管理：`POST /quota/accounts`、`POST /quota/rules`（mode=shared/dedicated）、
+`POST /quota/limits`（`{scope_rule?, amount, effective_from?}`）
+采集：`POST /quota/holds`、`POST /quota/vouchers`、`POST /quota/aborts`、
+`GET /quota/events`、`POST /quota/events/{id}/requeue`
+门禁/凭证查询：`GET /quota/holds`、`GET /quota/vouchers`
+核算：`POST /quota/batches/seal`、`POST /quota/batches/auto-seal`、
+`GET /quota/batches/{account}/{date}/page`
+财务：`GET /quota/adjustments`、`POST /quota/adjustments/{id}/decision`
+（confirm/reject，可修正带符号金额）、`POST /quota/adjustments/manual`
+解释：`GET /quota/usage/{account}?scope_rule=&batch_date=`、
+`GET /quota/trace/{serial}`
+运维：`POST /quota/tick/{collector|gate|accountant}`（手动触发一个工作周期）
 
 ## 设计取舍
 

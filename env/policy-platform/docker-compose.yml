@@ -66,5 +66,20 @@ services:
     ports:
       - "8004:8004"
 
+  # 三个组件可分开启动：QUOTA_ROLE=collector / gate / accountant（逗号可组合），
+  # 默认 all 同进程全部启动；状态全在数据库，任一组件中断重启后接着进度处理。
+  quota:
+    build: .
+    command: ["uvicorn", "app.quota.main:app", "--host", "0.0.0.0", "--port", "8005"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://policy:policy@db:5432/policy
+      SERVICE_NAME: quota
+      QUOTA_ROLE: all
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8005:8005"
+
 volumes:
   pgdata:

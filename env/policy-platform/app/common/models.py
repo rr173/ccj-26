@@ -365,3 +365,328 @@ class DebugEpoch(Base):
     service = Column(String(64), nullable=False, default="debugger")
     ts = Column(DateTime(timezone=True), default=utcnow)
     heartbeat_at = Column(DateTime(timezone=True))
+
+# ---------------------------------------------------------------------------
+# 资源消耗台账与周期限额（quota 服务 :8005）
+#
+# 一次规则判定的生命周期：
+#   判定开始  -> 占用（hold，预估量先占余额）
+#   判定结束  -> 凭证（voucher，真实消耗）到达 -> 销账（settle，差额自动补退）
+#   异常/超时 -> 归还（release）回产生占用的那个周期
+# 同一条业务流水 serial 串起：占用事件 -> 占用 -> 凭证 -> 结算/归还 -> 账页行/调整。
+#
+# 周期按「账户时区日」切分（batch_date = 发生时刻在账户时区下的日期）。
+# 批次封账(SEALED)后整体快照成只读账页；晚到凭证不再进账页，先挂起，
+# 财务确认后另记 adjustment_entry（补账 + / 冲账 -），原账页永不覆盖。
+#
+# 不可变表（settlements / releases / page_lines / pages / adjustment_entries /
+# inbox_events 去重后）在 Postgres 上由 DDL 触发器拒绝 UPDATE/DELETE；
+# SQLite 下由应用服务层只追加约定保证。
+# ---------------------------------------------------------------------------
+
+class QuotaAccount(Base):
+    """限额账户。结算周期按 timezone 的本地日切（如 Asia/Shanghai 按 UTC+8 切日）。"""
+
+    __tablename__ = "quota_accounts"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(128), unique=True, index=True, nullable=False)
+    timezone = Column(String(64), nullable=False, default="UTC")
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    created_by = Column(String(128), default="anonymous")
+
+
+class QuotaRule(Base):
+    """账户下的判定规则。
+
+    mode = "shared"：并入账户共享池（scope_rule 固定为 SHARED_SCOPE=""），
+                     多条规则共用同一份限额；
+    mode = "dedicated"：以规则名为 scope 独立设限（限额版本独立）。
+    """
+
+    __tablename__ = "quota_rules"
+    __table_args__ = (
+        UniqueConstraint("account_id", "rule_name", name="uq_quota_rule"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("quota_accounts.id"), nullable=False, index=True)
+    rule_name = Column(String(128), nullable=False)
+    mode = Column(String(16), nullable=False, default="dedicated")
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    created_by = Column(String(128), default="anonymous")
+
+
+class QuotaVersion(Base):
+    """限额版本：同一限额作用域（账户+scope_rule）的限额可变更。
+
+    scope_rule = ""（SHARED_SCOPE）表示账户共享池；否则为某条独立设限规则。
+    effective_from 为「选定批次」（账户时区日，YYYY-MM-DD）：新版本从该日批次
+    起生效；该日之前（含已经封账）的批次不重新计算。同一作用域版本号单调递增。
+    """
+
+    __tablename__ = "quota_versions"
+    __table_args__ = (
+        UniqueConstraint("account_id", "scope_rule", "version",
+                         name="uq_quota_version"),
+        Index("ix_quota_version_scope", "account_id", "scope_rule", "effective_from"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("quota_accounts.id"), nullable=False)
+    scope_rule = Column(String(128), nullable=False)   # "" = 共享池
+    version = Column(Integer, nullable=False)
+    limit_amount = Column(BigInteger, nullable=False)
+    effective_from = Column(String(10), nullable=False)  # YYYY-MM-DD（含当日）
+    note = Column(String(512), default="")
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    created_by = Column(String(128), default="anonymous")
+
+
+class QuotaBatch(Base):
+    """结算批次：账户 × 账户时区日。当日批次 OPEN；封账后 SEALED 且不得再动账页。"""
+
+    __tablename__ = "quota_batches"
+    __table_args__ = (
+        UniqueConstraint("account_id", "batch_date", name="uq_quota_batch"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("quota_accounts.id"), nullable=False, index=True)
+    batch_date = Column(String(10), nullable=False)        # YYYY-MM-DD（账户时区）
+    status = Column(String(8), nullable=False, default="OPEN", index=True)
+    sealed_at = Column(DateTime(timezone=True))
+    sealed_by = Column(String(128))
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class QuotaInboxEvent(Base):
+    """采集端入站事件（凭证 / 占用申请 / 放弃）。只追加。
+
+    (serial, event_type) 唯一：重投（相同流水号+事件类型）直接判重复，绝不重复入账；
+    凭证先到、占用后到等乱序场景由 gate/accountant 的处理函数容忍（查不到配对先
+    挂回 NEW，后续周期重试）。claimed_by 为当前认领实例（崩溃恢复后可被重新认领）。
+    """
+
+    __tablename__ = "quota_inbox_events"
+    __table_args__ = (
+        UniqueConstraint("serial", "event_type", name="uq_quota_inbox_serial_type"),
+        Index("ix_quota_inbox_status_type", "status", "event_type"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    serial = Column(String(128), nullable=False)
+    event_type = Column(String(16), nullable=False)      # hold | voucher | abort
+    account = Column(String(128), nullable=False)
+    rule_name = Column(String(128), nullable=False, default="")
+    occurred_at = Column(DateTime(timezone=True), nullable=False)
+    payload = Column(JSON, nullable=False, default=dict)
+    source = Column(String(128), default="http")        # http | spool | ...
+    # NEW：待处理；PROCESSING：被某实例认领；DONE：已落地；FAILED：永久失败
+    status = Column(String(16), nullable=False, default="NEW", index=True)
+    claimed_by = Column(String(128))
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(String(1024))
+    received_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+    processed_at = Column(DateTime(timezone=True))
+
+
+class QuotaHold(Base):
+    """判定开始时的余额占用（按预估量）。状态机：HELD -> SETTLED / RELEASED。
+
+    batch_date 是占用产生的批次（开始时刻在账户时区的日期）；归还永远回到这个批次。
+    reject_reason 非空表示门禁拒绝（余额不足/批次已封账…），此时不占任何余额，
+    同 serial 的真实凭证若后来到达，仍按晚到凭证流程挂起等财务确认。
+    """
+
+    __tablename__ = "quota_holds"
+    __table_args__ = (
+        UniqueConstraint("serial", name="uq_quota_hold_serial"),
+        Index("ix_quota_hold_state", "status", "expires_at"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    serial = Column(String(128), nullable=False)
+    account_id = Column(Integer, ForeignKey("quota_accounts.id"), nullable=False, index=True)
+    rule_name = Column(String(128), nullable=False, default="")
+    scope_rule = Column(String(128), nullable=False)    # 作用域快照（""=共享池）
+    amount = Column(BigInteger, nullable=False)         # 预估占用量
+    batch_date = Column(String(10), nullable=False)     # 产生周期
+    status = Column(String(16), nullable=False, default="HELD", index=True)
+    # HELD | SETTLED | RELEASED | REJECTED
+    reject_reason = Column(String(64))
+    ttl_s = Column(Integer)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True))
+    finished_at = Column(DateTime(timezone=True))
+    created_by = Column(String(128), default="anonymous")
+
+
+class QuotaVoucher(Base):
+    """业务端提交的消耗凭证（真实消耗）。只追加。
+
+    status:
+      PENDING   等待配对/处理（先到于占用事件、或等待批次核算）
+      SETTLED   已销账（真实消耗已入账，差额从占用补退）
+      SUSPENDED 晚到凭证：所属批次已封账，挂起等待财务确认
+      ADJUSTED  已由财务确认并另记调整（补账/冲账）
+    """
+
+    __tablename__ = "quota_vouchers"
+    __table_args__ = (
+        UniqueConstraint("serial", name="uq_quota_voucher_serial"),
+        Index("ix_quota_voucher_status", "status"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    serial = Column(String(128), nullable=False)
+    account_id = Column(Integer, ForeignKey("quota_accounts.id"), nullable=False, index=True)
+    rule_name = Column(String(128), nullable=False, default="")
+    scope_rule = Column(String(128), nullable=False, default="")
+    amount = Column(BigInteger, nullable=False)         # 真实消耗量（>=0）
+    kind = Column(String(16), nullable=False, default="consume")  # consume|reverse
+    occurred_at = Column(DateTime(timezone=True), nullable=False)
+    batch_date = Column(String(10), nullable=False)     # 发生时刻所属批次
+    status = Column(String(16), nullable=False, default="PENDING", index=True)
+    suspend_reason = Column(String(64))
+    received_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class QuotaSettlement(Base):
+    """销账记录（只追加）：同一 hold_serial 唯一 —— 同一流水多次销账只生效一次。"""
+
+    __tablename__ = "quota_settlements"
+    __table_args__ = (
+        UniqueConstraint("hold_serial", name="uq_quota_settlement_hold"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    serial = Column(String(128), nullable=False, index=True)  # 凭证流水
+    hold_serial = Column(String(128), nullable=False)
+    account_id = Column(Integer, nullable=False, index=True)
+    scope_rule = Column(String(128), nullable=False)
+    held_amount = Column(BigInteger, nullable=False)
+    actual_amount = Column(BigInteger, nullable=False)
+    # 相对占用的净变化：正=追加占用（真实>预估），负=退回余额
+    delta_amount = Column(BigInteger, nullable=False)
+    # 账记在真实消耗发生的批次；与占用批次不同即跨周期销账
+    batch_date = Column(String(10), nullable=False, index=True)
+    origin_batch_date = Column(String(10), nullable=False)
+    over_limit = Column(Boolean, nullable=False, default=False)
+    ts = Column(DateTime(timezone=True), default=utcnow)
+
+
+class QuotaRelease(Base):
+    """占用归还记录（只追加）：异常退出 / 超时 / 主动放弃。
+
+    归还永远落在 hold.origin_batch（产生占用的周期）。跨周期未结束的占用
+    即使在更晚周期才被回收，也回到产生它的那一天。
+    """
+
+    __tablename__ = "quota_releases"
+    __table_args__ = (
+        UniqueConstraint("hold_serial", name="uq_quota_release_hold"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    serial = Column(String(128), nullable=False, index=True)
+    hold_serial = Column(String(128), nullable=False)
+    account_id = Column(Integer, nullable=False, index=True)
+    scope_rule = Column(String(128), nullable=False)
+    amount = Column(BigInteger, nullable=False)
+    batch_date = Column(String(10), nullable=False)     # 归还目标批次=占用产生批次
+    reason = Column(String(32), nullable=False)         # abort | timeout | sealed_late
+    ts = Column(DateTime(timezone=True), default=utcnow)
+    reaped_by = Column(String(128), default="gate")
+
+
+class QuotaPage(Base):
+    """封账账页（只追加、不可改）：批次封账时对当时账目的整体快照。"""
+
+    __tablename__ = "quota_pages"
+    __table_args__ = (
+        UniqueConstraint("batch_id", name="uq_quota_page_batch"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    batch_id = Column(Integer, ForeignKey("quota_batches.id"), nullable=False)
+    account_id = Column(Integer, nullable=False, index=True)
+    batch_date = Column(String(10), nullable=False, index=True)
+    # 快照：[{scope_rule, rule?, limit_version, limit_amount, settled, held_open,
+    #        rejected, serials:{...}}]
+    snapshot = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    created_by = Column(String(128), default="accountant")
+
+
+class QuotaPageLine(Base):
+    """账页明细行（只追加）：封账时刻每条结算/未结占用/拒绝在账页上固化的一行。"""
+
+    __tablename__ = "quota_page_lines"
+    __table_args__ = (
+        UniqueConstraint("page_id", "line_no", name="uq_quota_page_line"),
+        Index("ix_quota_page_line_scope", "page_id", "scope_rule"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    page_id = Column(Integer, ForeignKey("quota_pages.id"), nullable=False)
+    line_no = Column(Integer, nullable=False)
+    serial = Column(String(128), nullable=False, index=True)
+    scope_rule = Column(String(128), nullable=False)
+    line_type = Column(String(16), nullable=False)     # settlement | open_hold | rejected
+    amount = Column(BigInteger, nullable=False)
+    detail = Column(JSON, nullable=False, default=dict)
+
+
+class QuotaAdjustment(Base):
+    """调整单：晚到凭证先挂起（PENDING），财务确认后另记补账/冲账（CONFIRMED）。
+
+    原账页（quota_pages / quota_page_lines）永不改写；调整结果写
+    quota_adjustment_entries（只追加），并把原凭证置 ADJUSTED。
+    冲账 amount 为负；财务可在确认时修正金额，但冲账后该作用域调整净额
+    不得为负（不能冲掉不存在的消耗）。
+    """
+
+    __tablename__ = "quota_adjustments"
+    __table_args__ = (
+        UniqueConstraint("serial", "batch_date", name="uq_quota_adj_serial_batch"),
+        Index("ix_quota_adj_scope_status", "account_id", "scope_rule", "status"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    serial = Column(String(128), nullable=False, index=True)
+    account_id = Column(Integer, ForeignKey("quota_accounts.id"), nullable=False, index=True)
+    scope_rule = Column(String(128), nullable=False)
+    rule_name = Column(String(128), nullable=False, default="")
+    batch_date = Column(String(10), nullable=False)
+    voucher_amount = Column(BigInteger, nullable=False)
+    requested_kind = Column(String(16), nullable=False, default="consume")
+    # PENDING -> CONFIRMED / REJECTED
+    status = Column(String(16), nullable=False, default="PENDING", index=True)
+    reason = Column(String(64), nullable=False)        # late_voucher ...
+    detail = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    decided_by = Column(String(128))
+    decided_at = Column(DateTime(timezone=True))
+    decision_note = Column(String(512), default="")
+
+
+class QuotaAdjustmentEntry(Base):
+    """已确认调整的入账分录（只追加）：补账 amount>0，冲账 amount<0。"""
+
+    __tablename__ = "quota_adjustment_entries"
+    __table_args__ = (
+        UniqueConstraint("adjustment_id", name="uq_quota_adj_entry"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    adjustment_id = Column(Integer, ForeignKey("quota_adjustments.id"), nullable=False)
+    serial = Column(String(128), nullable=False, index=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    scope_rule = Column(String(128), nullable=False)
+    batch_date = Column(String(10), nullable=False, index=True)
+    amount = Column(BigInteger, nullable=False)       # 有符号：补+ / 冲-
+    kind = Column(String(16), nullable=False)         # supplement | reversal
+    limit_version = Column(Integer, nullable=False)   # 按该批次当时有效限额版本
+    ts = Column(DateTime(timezone=True), default=utcnow)
+    confirmed_by = Column(String(128), default="anonymous")

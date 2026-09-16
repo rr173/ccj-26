@@ -7,13 +7,14 @@ EDITOR=${EDITOR_URL:-http://localhost:8001}
 COMPILER=${COMPILER_URL:-http://localhost:8002}
 RUNTIME=${RUNTIME_URL:-http://localhost:8003}
 DEBUGGER=${DEBUGGER_URL:-http://localhost:8004}
+QUOTA=${QUOTA_URL:-http://localhost:8005}
 
 command -v jq >/dev/null || { echo "需要 jq"; exit 1; }
 
 step() { echo; echo "=== $* ==="; }
 
-step "0. 等待四个服务就绪"
-for url in "$EDITOR/health" "$COMPILER/health" "$RUNTIME/health" "$DEBUGGER/health"; do
+step "0. 等待五个服务就绪"
+for url in "$EDITOR/health" "$COMPILER/health" "$RUNTIME/health" "$DEBUGGER/health" "$QUOTA/health"; do
   for i in $(seq 1 30); do
     curl -sf "$url" >/dev/null 2>&1 && break
     [ "$i" = 30 ] && { echo "服务未就绪: $url"; exit 1; }
@@ -168,5 +169,44 @@ step "15. 时间线：推进 / 暂停 / 错误 / 分叉 / 接管 全程留痕"
 curl -s "$DEBUGGER/debug/sessions/$SID/timeline" \
   | jq -c '{events: [.events[].event_type], branches: [.branches[] | {id: .branch_id, status, position}]}'
 echo "租约到期后他人可 POST /debug/sessions/$SID/lease/takeover 接管"
+
+step "16. 资源台账：开户（上海时区）+ 两条规则共用池 200 与独立限额 100"
+curl -s -X POST "$QUOTA/quota/accounts" -H 'content-type: application/json' \
+  -d '{"name":"demo","timezone":"Asia/Shanghai","actor":"op"}' | jq -c .
+curl -s -X POST "$QUOTA/quota/rules" -H 'content-type: application/json' \
+  -d '{"account":"demo","rule_name":"fraud","mode":"dedicated","initial_limit":100}' | jq -c '{rule: .rule_name, scope}'
+
+step "17. 判定开始先占用：60 通过、再来 50 被门禁拒绝（总量不破 100），重投返回 duplicate"
+curl -s -X POST "$QUOTA/quota/holds" -H 'content-type: application/json' \
+  -d '{"serial":"d1","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:00:00+08:00","amount":60}' | jq -c .
+curl -s -X POST "$QUOTA/quota/holds" -H 'content-type: application/json' \
+  -d '{"serial":"d1","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:00:00+08:00","amount":60}' | jq -c .
+curl -s -X POST "$QUOTA/quota/holds" -H 'content-type: application/json' \
+  -d '{"serial":"d2","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:00:00+08:00","amount":50}' | jq -c .
+curl -s -X POST "$QUOTA/tick/gate" >/dev/null
+curl -s "$QUOTA/quota/holds?account=demo" | jq -c '[.[] | {serial, status, reject_reason}]'
+
+step "18. 真实消耗 40 销账（预估 60，差额 20 自动退回），可花余额回到 60"
+curl -s -X POST "$QUOTA/quota/vouchers" -H 'content-type: application/json' \
+  -d '{"serial":"d1","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T10:05:00+08:00","amount":40}' >/dev/null
+curl -s -X POST "$QUOTA/tick/accountant" >/dev/null
+curl -s "$QUOTA/quota/usage/demo?scope_rule=fraud&batch_date=2026-09-16" \
+  | jq -c '.scopes[0] | {limit: .limit.amount, held: .held.amount, settled: .settled.amount, available}'
+
+step "19. 封账形成只读账页；晚到凭证挂起，财务确认后另记补账，原账页不覆盖"
+curl -s -X POST "$QUOTA/quota/batches/seal" -H 'content-type: application/json' \
+  -d '{"account":"demo","batch_date":"2026-09-16"}' | jq -c '.page | {page_id, lines: [.lines[] | {serial, type, amount}]}'
+curl -s -X POST "$QUOTA/quota/vouchers" -H 'content-type: application/json' \
+  -d '{"serial":"d3","account":"demo","rule_name":"fraud","occurred_at":"2026-09-16T12:00:00+08:00","amount":7}' >/dev/null
+curl -s -X POST "$QUOTA/tick/accountant" >/dev/null
+AID=$(curl -s "$QUOTA/quota/adjustments?status=PENDING" | jq '.[0].id')
+curl -s -X POST "$QUOTA/quota/adjustments/$AID/decision" -H 'content-type: application/json' \
+  -d '{"decision":"confirm","actor":"cfo","amount":7}' | jq -c '{status, entry: {kind: .entry.kind, amount: .entry.amount}}'
+echo "-- 账页原文 + 封账后附录："
+curl -s "$QUOTA/quota/batches/demo/2026-09-16/page" \
+  | jq -c '{lines: [.lines[].serial], appendix: .post_seal_appendix.adjustment_entries}'
+
+step "20. 沿流水 d1 串起占用、销账、账页全过程"
+curl -s "$QUOTA/quota/trace/d1" | jq -c '[.timeline[] | {stage, label}]'
 
 echo; echo "演示完成。"

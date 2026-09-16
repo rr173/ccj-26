@@ -159,3 +159,80 @@ class DebugLeaseRequest(BaseModel):
 class DebugLeaseTakeoverRequest(BaseModel):
     actor: str = Field(min_length=1)
     ttl_s: Optional[int] = Field(default=None, ge=1)
+
+
+# ---------- 资源消耗台账与周期限额（quota :8005） ----------
+
+class QuotaAccountCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    timezone: str = "UTC"
+    actor: str = "anonymous"
+
+
+class QuotaRuleRegister(BaseModel):
+    account: str = Field(min_length=1)
+    rule_name: str = Field(min_length=1, max_length=128)
+    mode: str = "dedicated"                # shared（共享池）| dedicated（独立设限）
+    initial_limit: Optional[int] = Field(default=None, ge=0)
+    actor: str = "anonymous"
+
+
+class QuotaLimitSet(BaseModel):
+    account: str = Field(min_length=1)
+    # scope_rule 为空串/省略 = 账户共享池；否则为 dedicated 规则名
+    scope_rule: str = ""
+    amount: int = Field(ge=0)
+    # 选定批次（含当日）起生效；None = 账户时区今天。已封账批次会 409
+    effective_from: Optional[str] = None
+    note: str = ""
+    actor: str = "anonymous"
+
+
+class QuotaHoldSubmit(BaseModel):
+    serial: str = Field(min_length=1, max_length=128)
+    account: str = Field(min_length=1)
+    rule_name: str = Field(min_length=1, max_length=128)
+    occurred_at: datetime                  # 判定开始时刻（带时区）
+    amount: int = Field(ge=0)              # 预估消耗量（先占余额）
+    ttl_s: Optional[int] = Field(default=None, ge=1)
+
+
+class QuotaVoucherSubmit(BaseModel):
+    serial: str = Field(min_length=1, max_length=128)
+    account: str = Field(min_length=1)
+    rule_name: str = Field(min_length=1, max_length=128)
+    occurred_at: datetime                  # 真实发生时刻（带时区）
+    amount: int = Field(ge=0)              # 真实消耗量
+    kind: str = "consume"                  # consume | reverse
+
+
+class QuotaAbortSubmit(BaseModel):
+    serial: str = Field(min_length=1, max_length=128)
+    account: str = Field(min_length=1)
+    rule_name: str = ""
+    occurred_at: datetime
+    reason: str = "abort"
+
+
+class QuotaSealRequest(BaseModel):
+    account: str = Field(min_length=1)
+    batch_date: str = Field(min_length=10, max_length=10)  # YYYY-MM-DD
+    actor: str = "accountant"
+
+
+class QuotaAdjustmentDecision(BaseModel):
+    decision: str                           # confirm | reject
+    actor: str = "finance"
+    # 确认时可由财务修正金额（带符号：正补账/负冲账）；None = 按凭证原始方向金额
+    amount: Optional[int] = None
+    note: str = ""
+
+
+class QuotaManualAdjustment(BaseModel):
+    account: str = Field(min_length=1)
+    scope_rule: str = ""
+    batch_date: str = Field(min_length=10, max_length=10)
+    amount: int                             # 非零有符号：正补账 / 负冲账
+    serial: str = Field(min_length=1, max_length=128)
+    note: str = ""
+    actor: str = "finance"
